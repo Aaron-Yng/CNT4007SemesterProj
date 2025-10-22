@@ -4,6 +4,42 @@ from threading import Thread
 import pathlib
 from pathlib import Path
 import sys
+import struct
+
+# Protocal Constants
+HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"  # 18 bytes
+HANDSHAKE_PAD = b"\x00" * 10              # 10 bytes
+
+# message type IDs
+MSG_CHOKE = 0
+MSG_UNCHOKE = 1
+MSG_INTERESTED = 2
+MSG_NOT_INTERESTED = 3
+MSG_HAVE = 4
+MSG_BITFIELD = 5
+MSG_REQUEST = 6
+MSG_PIECE = 7
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    # Receive exactly n bytes from a blocking socket.
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("socket closed while receiving")
+        data += chunk
+    return data
+
+
+def _u32(i: int) -> bytes:
+    #big-endian unsigned 32-bit
+    return struct.pack(">I", int(i))
+
+
+def _from_u32(b: bytes) -> int:
+    """parse big-endian unsigned 32-bit"""
+    return struct.unpack(">I", b)[0]
 
 
 class Peer:
@@ -78,6 +114,25 @@ class Peer:
                 except: 
                     pass
 
+        # ---- message framing helpers (length-prefixed per spec) ----
+    
+    def send_msg(self, sock: socket.socket, msg_id: int, payload: bytes = b"") -> None:
+        try:
+            length = 1 + (len(payload) if payload else 0)
+            sock.sendall(_u32(length) + struct.pack("B", msg_id) + (payload or b""))
+        except Exception as e:
+            # For midpoint we just print; later we might log/raise
+            print(f"[peer {self.id}] send_msg error: {e}")
+
+    def recv_msg(self, sock: socket.socket) -> tuple[int, bytes]:
+        hdr = _recv_exact(sock, 4)
+        (length,) = struct.unpack(">I", hdr)
+        if length < 1:
+            raise ValueError("invalid message length")
+        body = _recv_exact(sock, length)
+        msg_id = body[0]
+        payload = body[1:]
+        return msg_id, payload
 
     #server side functionality
     #listens for connections
@@ -110,21 +165,40 @@ class Peer:
                 break
 
     # connect out to another peer using (host, port) from PeerInfo.cfg
-    def dial_peer(self, host: str, port: int):
+    def dial_peer(self, host: str, port: int, remote_id: int):
         try:
             s = socket.create_connection((host, int(port)), timeout=3)
-            # reuse your per-connection handler exactly as-is
+            # log: we (self.id) make a connection to remote_id
+            self.log_makes_connection(remote_id)
+            # send our peer id (4 bytes) so the server can log "connected from"
+            s.sendall(_u32(self.id))
+            # reuse handler (it will still send your 'hello' and close)
             self.connect_peer(s)
         except Exception as e:
-            print(f"[peer {self.id}] dial to {host}:{port} failed: {e}")    
+            print(f"[peer {self.id}] dial to {host}:{port} failed: {e}") 
 
     #connect to peer
     #still in progress
-    def connect_peer(self, connection: socket):
-        #main func of peer class, main equivalent, does handshake then handles msgs
-        # minimal placeholder so we can see activity now (replace with real handshake later)
+    def connect_peer(self, connection: socket.socket):
+        # main func of peer class, main equivalent, does handshake then handles msgs
         try:
+            # read 4 bytes peer id if the dialer sent it; if not present, ignore gracefully
+            try:
+                connection.settimeout(1.0)
+                raw = _recv_exact(connection, 4)
+                other_id = _from_u32(raw)
+                self.log_connected_from(other_id)
+            except Exception:
+                pass
+            finally:
+                try:
+                    connection.settimeout(None)
+                except:
+                    pass
+
+            # minimal placeholder so we can see activity now (replace with real handshake later)
             connection.sendall(b"hello from peer\n")
+
         except Exception as e:
             print(f"[peer {self.id}] handler error: {e}")
         finally:
@@ -133,7 +207,28 @@ class Peer:
             except:
                 pass
         return
-    
+
+# log helpers for TCP connection events (simplified versions)
+    def _log_path(self) -> Path:
+        return Path(f"log_peer_{self.id}.log")
+
+    def _timestamp(self) -> str:
+        import datetime
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _log(self, line: str) -> None:
+        try:
+            with self._log_path().open("a", encoding="utf-8") as f:
+                f.write(f"[{self._timestamp()}]: {line}\n")
+        except Exception as e:
+            print(f"[peer {self.id}] log error: {e}")
+
+    def log_makes_connection(self, other_id: int) -> None:
+        self._log(f"Peer [{self.id}] makes a connection to Peer [{other_id}].")
+
+    def log_connected_from(self, other_id: int) -> None:
+        self._log(f"Peer [{self.id}] is connected from Peer [{other_id}].")
+
 
 if __name__ == "__main__":
     id: int = int(sys.argv[1])
@@ -148,7 +243,7 @@ if __name__ == "__main__":
     for pid, info in peer.peers.items():
         if pid < peer.id:
             host, port, has = info
-            Thread(target= peer.dial_peer, args=(host, port), daemon=True).start()
+            Thread(target=peer.dial_peer, args=(host, port, pid), daemon=True).start()
 
     
     try:
