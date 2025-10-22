@@ -20,6 +20,15 @@ MSG_BITFIELD = 5
 MSG_REQUEST = 6
 MSG_PIECE = 7
 
+def build_handshake(peer_id: int) -> bytes:
+    return HANDSHAKE_HEADER + HANDSHAKE_PAD + _u32(peer_id)
+
+def parse_handshake(data: bytes) -> int | None:
+    if len(data) != 32 or not data.startswith(HANDSHAKE_HEADER):
+        print(f"Bad handshake len={len(data)} data={data}")
+        return None
+    return _from_u32(data[-4:])
+    
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     # Receive exactly n bytes from a blocking socket.
@@ -171,7 +180,7 @@ class Peer:
             # log: we (self.id) make a connection to remote_id
             self.log_makes_connection(remote_id)
             # send our peer id (4 bytes) so the server can log "connected from"
-            s.sendall(_u32(self.id))
+            #s.sendall(_u32(self.id))
             # reuse handler (it will still send your 'hello' and close)
             self.connect_peer(s)
         except Exception as e:
@@ -179,34 +188,94 @@ class Peer:
 
     #connect to peer
     #still in progress
-    def connect_peer(self, connection: socket.socket):
+    '''def connect_peer(self, connection: socket.socket):
         # main func of peer class, main equivalent, does handshake then handles msgs
         try:
+            my_handshake = build_handshake(self.id)
+            connection.sendall(my_handshake)
             # read 4 bytes peer id if the dialer sent it; if not present, ignore gracefully
             try:
-                connection.settimeout(1.0)
-                raw = _recv_exact(connection, 4)
-                other_id = _from_u32(raw)
+                their_handshake = _recv_exact(connection, 32)
+                other_id = parse_handshake(their_handshake)
+                if other_id is None:
+                    print(f"[peer {self.id}] invalid handshake received")
+                    return
                 self.log_connected_from(other_id)
-            except Exception:
+                print(f"[peer {self.id}] handshake successfully with peer {other_id}")
+            except Exception as e:
+                print(f"[peer {self.id}] failed receiving handshake: {e}")
+                return
+            
+
+                #connection.settimeout(1.0)
+                #raw = _recv_exact(connection, 4)
+                #other_id = _from_u32(raw)
+                #self.log_connected_from(other_id)
+        except Exception:
+            pass
+        finally:
+            try:
+                connection.settimeout(None)
+            except:
                 pass
-            finally:
-                try:
-                    connection.settimeout(None)
-                except:
-                    pass
 
             # minimal placeholder so we can see activity now (replace with real handshake later)
-            connection.sendall(b"hello from peer\n")
+            #connection.sendall(b"hello from peer\n")
 
         except Exception as e:
-            print(f"[peer {self.id}] handler error: {e}")
+        print(f"[peer {self.id}] handler error: {e}")
         finally:
             try:
                 connection.close()
             except:
                 pass
-        return
+        return'''
+    def connect_peer(self, connection: socket.socket):
+    
+        try:
+            my_handshake = build_handshake(self.id)
+            connection.sendall(my_handshake)
+
+            try:
+                their_handshake = _recv_exact(connection, 32)
+                other_id = parse_handshake(their_handshake)
+                if other_id is None:
+                    print(f"[peer {self.id}] invalid handshake received")
+                    return
+                self.log_connected_from(other_id)
+                print(f"[peer {self.id}] handshake successful with peer {other_id}")
+            except Exception as e:
+                print(f"[peer {self.id}] failed receiving handshake: {e}")
+                return
+
+            total_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
+            self.total_pieces = total_pieces
+            has_file = self.peers[self.id][2] == 1
+            bitfield = Bitfield(total_pieces, has_file)
+            self.send_msg(connection, MSG_BITFIELD, bitfield.to_bytes())
+            self._log(f"Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
+
+            while True:
+                try:
+                    msg_id, payload = self.recv_msg(connection)
+                    self.handle_message(msg_id, payload, connection)
+                except ConnectionError:
+                    print(f"[peer {self.id}] connection closed by peer {other_id}")
+                    break
+                except Exception as e:
+                    print(f"[peer {self.id}] error in message loop: {e}")
+                    break
+
+        except Exception as e:
+            print(f"[peer {self.id}] handler error: {e}")
+
+        finally:
+            try:
+                connection.close()
+            except:
+                pass
+            print(f"[peer {self.id}] closed connection.")
+
 
 # log helpers for TCP connection events (simplified versions)
     def _log_path(self) -> Path:
@@ -228,6 +297,104 @@ class Peer:
 
     def log_connected_from(self, other_id: int) -> None:
         self._log(f"Peer [{self.id}] is connected from Peer [{other_id}].")
+
+    def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
+        if msg_id == MSG_CHOKE:
+            self.choked = True
+            self._log(f"Peer [{self.id}] received CHOKE.")
+        elif msg_id == MSG_UNCHOKE:
+            self.choked = False
+            self._log(f"Peer [{self.id}] received UNCHOKE.")
+        elif msg_id == MSG_INTERESTED:
+            self.interested = True
+            self._log(f"Peer [{self.id}] received INTERESTED.")
+        elif msg_id == MSG_NOT_INTERESTED:
+            self.interested = False
+            self._log(f"Peer [{self.id}] received NOT INTERESTED.")
+        elif msg_id == MSG_BITFIELD:
+            other_bf = Bitfield.from_bytes(payload, self.total_pieces)
+            print(f"[peer {self.id}] received bitfield {other_bf.bits[:8]}...")
+            self._log(f"Peer [{self.id}] received BITFIELD.")
+
+            if hasattr(self, "bitfield"):
+                interested = any(
+                    my_bit == 0 and their_bit == 1
+                    for my_bit, their_bit in zip(self.bitfield.bits, other_bf.bits)
+                )
+                if interested:
+                    self.send_interested(conn)
+                else:
+                    self.send_not_interested(conn)
+
+    
+class Bitfield:
+    def __init__(self, total_pieces: int, has_all: bool):
+        self.bits = [1 if has_all else 0] * total_pieces
+
+    def has_piece(self, index: int) -> bool:
+        return bool(self.bits[index])
+
+    def set_piece(self, index: int):
+        self.bits[index] = 1
+
+    def to_bytes(self) -> bytes:
+        out = bytearray()
+        for i in range(0, len(self.bits), 8):
+            byte = 0
+            for bit in self.bits[i:i+8]:
+                byte = (byte << 1) | bit
+            out.append(byte)
+        return bytes(out)
+
+    @classmethod
+    def from_bytes(cls, data: bytes, total_pieces: int):
+        bits = []
+        for byte in data:
+            for i in range(8):
+                bits.append((byte >> (7 - i)) & 1)
+        b = cls(total_pieces, False)
+        b.bits = bits[:total_pieces]
+        return b
+
+
+def choke_peer(self, conn: socket.socket):
+    self.send_msg(conn, MSG_CHOKE)
+    self._log(f"Peer [{self.id}] choked its connection.")
+
+def unchoke_peer(self, conn: socket.socket):
+    self.send_msg(conn, MSG_UNCHOKE)
+    self._log(f"Peer [{self.id}] unchoked its connection.")
+
+
+def send_interested(self, conn: socket.socket):
+    self.send_msg(conn, MSG_INTERESTED)
+    self._log(f"Peer [{self.id}] sent 'interested'.")
+    print(f"[peer {self.id}] sent INTERESTED.")
+
+def send_not_interested(self, conn: socket.socket):
+    self.send_msg(conn, MSG_NOT_INTERESTED)
+    self._log(f"Peer [{self.id}] sent 'not interested'.")
+    print(f"[peer {self.id}] sent NOT INTERESTED.")
+
+def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
+    if msg_id == MSG_CHOKE:
+        self.choked = True
+        self._log(f"Peer [{self.id}] received CHOKE.")
+    elif msg_id == MSG_UNCHOKE:
+        self.choked = False
+        self._log(f"Peer [{self.id}] received UNCHOKE.")
+    elif msg_id == MSG_INTERESTED:
+        self.interested = True
+        self._log(f"Peer [{self.id}] received INTERESTED.")
+    elif msg_id == MSG_NOT_INTERESTED:
+        self.interested = False
+        self._log(f"Peer [{self.id}] received NOT INTERESTED.")
+    elif msg_id == MSG_BITFIELD:
+        other_bf = Bitfield.from_bytes(payload, self.total_pieces)
+        print(f"[peer {self.id}] received bitfield {other_bf.bits[:8]}...")
+        self._log(f"Peer [{self.id}] received BITFIELD.")
+
+
 
 
 if __name__ == "__main__":
