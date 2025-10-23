@@ -5,6 +5,9 @@ import pathlib
 from pathlib import Path
 import sys
 import struct
+import math
+import random
+import time
 
 # Protocal Constants
 HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"  # 18 bytes
@@ -60,6 +63,9 @@ class Peer:
         common: Path = Path("Common.cfg")
         peer_info: Path = Path("PeerInfo.cfg")
 
+        #create dict of other connections
+        self.connections = {}
+
         #populate common attributes
         with common.open() as f:
             for line in f:
@@ -103,7 +109,6 @@ class Peer:
                             pass
               
         #populate peer info, dict to hold id/info pairs
-#populate peer info, dict to hold id/info pairs
         self.peers = {}
         with peer_info.open() as f:
             for line in f:
@@ -122,6 +127,23 @@ class Peer:
                     self.peers[pid] = (host, port, has)
                 except: 
                     pass
+
+        #created dict to store bitfields of other peers 
+        self.peer_bitfields: dict[int, Bitfield] = {}
+
+        #populate own bitfield based on has
+        self.bitfield = Bitfield(math.ceil(self.file_size/self.piece_size), 0) if self.peers[self.id][2] == 0 else Bitfield(math.ceil(self.file_size/self.piece_size), 1)
+
+        #dict to track states of peers
+        #initial state is unchoked and not interested
+        self.peer_states = {}
+        for pid in self.peers.keys():
+            self.peer_states[pid] = {
+                "choked": True,
+                "interested": False,
+                "is_choked": True, #self is choked by other
+                "is_interested": False
+            }
 
         # ---- message framing helpers (length-prefixed per spec) ----
     
@@ -231,7 +253,7 @@ class Peer:
                 pass
         return'''
     def connect_peer(self, connection: socket.socket):
-    
+
         try:
             my_handshake = build_handshake(self.id)
             connection.sendall(my_handshake)
@@ -244,6 +266,9 @@ class Peer:
                     return
                 self.log_connected_from(other_id)
                 print(f"[peer {self.id}] handshake successful with peer {other_id}")
+                #add to connections
+                self.connections[other_id] = connection
+
             except Exception as e:
                 print(f"[peer {self.id}] failed receiving handshake: {e}")
                 return
@@ -258,7 +283,7 @@ class Peer:
             while True:
                 try:
                     msg_id, payload = self.recv_msg(connection)
-                    self.handle_message(msg_id, payload, connection)
+                    self.handle_message(msg_id, payload, connection, other_id)
                 except ConnectionError:
                     print(f"[peer {self.id}] connection closed by peer {other_id}")
                     break
@@ -298,33 +323,109 @@ class Peer:
     def log_connected_from(self, other_id: int) -> None:
         self._log(f"Peer [{self.id}] is connected from Peer [{other_id}].")
 
-    def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
+    def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket, other_id: int):
         if msg_id == MSG_CHOKE:
-            self.choked = True
+            self.peer_states[self.id]["choked"] = True
             self._log(f"Peer [{self.id}] received CHOKE.")
         elif msg_id == MSG_UNCHOKE:
-            self.choked = False
+            self.peer_states[self.id]["choked"] = False
             self._log(f"Peer [{self.id}] received UNCHOKE.")
         elif msg_id == MSG_INTERESTED:
-            self.interested = True
+            self.peer_states[self.id]["interested"] = True
             self._log(f"Peer [{self.id}] received INTERESTED.")
         elif msg_id == MSG_NOT_INTERESTED:
-            self.interested = False
+            self.peer_states[self.id]["interested"] = False
             self._log(f"Peer [{self.id}] received NOT INTERESTED.")
+        elif msg_id == MSG_HAVE:
+            #calls after request
+            #set piece in other bitfield
+            piece_index = _from_u32(payload)
+            self.peer_bitfields[other_id].set_piece(piece_index)
+
+            #check if interested
+            if self.bitfield.has_piece(piece_index):
+                #already has the piece
+                self.send_not_interested(conn)
+            else:
+                #doesn't have piece, is interested
+                self.send_interested(conn)
         elif msg_id == MSG_BITFIELD:
-            other_bf = Bitfield.from_bytes(payload, self.total_pieces)
-            print(f"[peer {self.id}] received bitfield {other_bf.bits[:8]}...")
+            self.peer_bitfields[other_id] = Bitfield.from_bytes(payload, self.total_pieces)
+            print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id][:8]}...")
             self._log(f"Peer [{self.id}] received BITFIELD.")
 
             if hasattr(self, "bitfield"):
                 interested = any(
                     my_bit == 0 and their_bit == 1
-                    for my_bit, their_bit in zip(self.bitfield.bits, other_bf.bits)
+                    for my_bit, their_bit in zip(self.bitfield.bits, self.peer_bitfields[other_id].bits)
                 )
                 if interested:
                     self.send_interested(conn)
                 else:
                     self.send_not_interested(conn)
+        elif msg_id == MSG_REQUEST:
+            #requests transfer of certain piece after being unchoked
+            #prevent request if currently choked else execute
+            if not self.peer_states[self.id]["choked"]:
+                self.send_request(conn, other_id)
+            self._log()
+        elif msg_id == MSG_PIECE:
+            #sends payload of 4 byte piece
+            #temporary log to prevent error msg
+            self._log()
+
+    def choke_peer(self, conn: socket.socket, other_id):
+        self.send_msg(conn, MSG_CHOKE)
+        self.peer_states[other_id]["choked"] = True
+        self._log(f"Peer [{self.id}] choked its connection.")
+
+    def unchoke_peer(self, conn: socket.socket, other_id):
+        self.send_msg(conn, MSG_UNCHOKE)
+        self.peer_states[other_id]["choked"] = False
+        self._log(f"Peer [{self.id}] unchoked its connection.")
+
+    def send_interested(self, conn: socket.socket, other_id):
+        self.send_msg(conn, MSG_INTERESTED)
+        self.peer_states[other_id]["interested"] = True
+        self._log(f"Peer [{self.id}] sent 'interested'.")
+        print(f"[peer {self.id}] sent INTERESTED.")
+
+    def send_not_interested(self, conn: socket.socket, other_id):
+        self.send_msg(conn, MSG_NOT_INTERESTED)
+        self.peer_states[other_id]["interested"] = False
+        self._log(f"Peer [{self.id}] sent 'not interested'.")
+        print(f"[peer {self.id}] sent NOT INTERESTED.")
+
+    def send_request(self, conn: socket.socket, other_id):
+        self.send_msg(conn, MSG_REQUEST)
+        self._log(f"Peer [{self.id}] has downloaded the piece TBD from [{other_id}]")
+
+    def choke_unchoke(self):
+        #stop time for unchoking interval
+        time.sleep(self.unchoking_interval)
+
+        #get list of interested peers using list comprehension
+        interested_peers = [pid for pid, vec in self.peer_states.items() if vec["interested"]]
+
+        #get 'num = preferred neighbors' random set of interested peers, all interested peers if num interested is < num preferred
+        preferred_peers = random.sample(interested_peers, min(self.preferred_neighbors, len(interested_peers)))
+
+        for pid in self.peer_states:
+            if pid in preferred_peers:
+                self.peer_states[pid]["choked"] = False
+
+                #check if connection exists and if it does then send msg to unchoke
+                if self.connections[pid]:
+                    self.unchoke_peer(self.connections[pid], pid)
+            else:
+                #must choke if not in preferred so num of peers currently unchoked doesn't exceed the preferred neighbors
+                self.peer_states[pid]["choked"] = True
+
+                #chokes if connection exists
+                if self.connections[pid]:
+                    self.choke_peer(self.connections[pid], pid)
+
+        
 
     
 class Bitfield:
@@ -355,26 +456,6 @@ class Bitfield:
         b = cls(total_pieces, False)
         b.bits = bits[:total_pieces]
         return b
-
-
-def choke_peer(self, conn: socket.socket):
-    self.send_msg(conn, MSG_CHOKE)
-    self._log(f"Peer [{self.id}] choked its connection.")
-
-def unchoke_peer(self, conn: socket.socket):
-    self.send_msg(conn, MSG_UNCHOKE)
-    self._log(f"Peer [{self.id}] unchoked its connection.")
-
-
-def send_interested(self, conn: socket.socket):
-    self.send_msg(conn, MSG_INTERESTED)
-    self._log(f"Peer [{self.id}] sent 'interested'.")
-    print(f"[peer {self.id}] sent INTERESTED.")
-
-def send_not_interested(self, conn: socket.socket):
-    self.send_msg(conn, MSG_NOT_INTERESTED)
-    self._log(f"Peer [{self.id}] sent 'not interested'.")
-    print(f"[peer {self.id}] sent NOT INTERESTED.")
 
 def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
     if msg_id == MSG_CHOKE:
