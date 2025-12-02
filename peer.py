@@ -9,7 +9,7 @@ import math
 import random
 import time
 
-# Protocal Constants
+# Protocol Constants
 HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"  # 18 bytes
 HANDSHAKE_PAD = b"\x00" * 10              # 10 bytes
 
@@ -53,7 +53,40 @@ def _from_u32(b: bytes) -> int:
     """parse big-endian unsigned 32-bit"""
     return struct.unpack(">I", b)[0]
 
+##########################################################################################
+#File Manager Class
+class FileManager:
+    #constructor
+    #assuming project only handles 1 file, so will store file specs including name in file manager itself
+    #if must handle multiple, then will move file specs/name to parameters of methods
+    def __init__(self, pid: int, file_name: str, file_size: int, piece_size: int, total_pieces: int, has_file: bool):
+        self.pid = pid
+        self.file_name = file_name
+        self.file_size = file_size
+        self.piece_size = piece_size
+        self.total_pieces = total_pieces
+        self.has_file = has_file
 
+        self.directory = Path(str(pid))
+        self.directory.mkdir(exist_ok = True) #create dir if not exist
+        self.pieces = [False] * total_pieces #init local bitmap to all false
+        self.lock = threading.Lock() #create a lock to ensure threading safety (blocks till lock is free)
+
+        self.load_file() #get pieces and update the local bitmap (piece)
+
+    #IN PROGRESS
+    def load_file(self):
+        if(self.has_file):
+            #separate entire file into pieces
+            return
+        else:
+            #get current pieces
+            return
+
+
+
+##########################################################################################
+#Peer Class
 class Peer:
     #constructor
     def __init__(self, id: int):
@@ -128,6 +161,15 @@ class Peer:
                 except: 
                     pass
 
+        #info parsed, can now start populating local properties
+                
+        #calc total_pieces and store as property
+        total_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
+        self.total_pieces = total_pieces
+                
+        #init a local file manager for this peer, accessing self.peers to search for own has status
+        self.file_manager = FileManager(pid, self.file_name, self.file_size, self.piece_size, self.total_pieces, self.peers[pid][2])
+
         #created dict to store bitfields of other peers 
         self.peer_bitfields: dict[int, Bitfield] = {}
 
@@ -144,8 +186,6 @@ class Peer:
                 "is_choked": True, #self is choked by other
                 "is_interested": False
             }
-
-        # ---- message framing helpers (length-prefixed per spec) ----
     
     def send_msg(self, sock: socket.socket, msg_id: int, payload: bytes = b"") -> None:
         try:
@@ -208,50 +248,7 @@ class Peer:
         except Exception as e:
             print(f"[peer {self.id}] dial to {host}:{port} failed: {e}") 
 
-    #connect to peer
-    #still in progress
-    '''def connect_peer(self, connection: socket.socket):
-        # main func of peer class, main equivalent, does handshake then handles msgs
-        try:
-            my_handshake = build_handshake(self.id)
-            connection.sendall(my_handshake)
-            # read 4 bytes peer id if the dialer sent it; if not present, ignore gracefully
-            try:
-                their_handshake = _recv_exact(connection, 32)
-                other_id = parse_handshake(their_handshake)
-                if other_id is None:
-                    print(f"[peer {self.id}] invalid handshake received")
-                    return
-                self.log_connected_from(other_id)
-                print(f"[peer {self.id}] handshake successfully with peer {other_id}")
-            except Exception as e:
-                print(f"[peer {self.id}] failed receiving handshake: {e}")
-                return
-            
 
-                #connection.settimeout(1.0)
-                #raw = _recv_exact(connection, 4)
-                #other_id = _from_u32(raw)
-                #self.log_connected_from(other_id)
-        except Exception:
-            pass
-        finally:
-            try:
-                connection.settimeout(None)
-            except:
-                pass
-
-            # minimal placeholder so we can see activity now (replace with real handshake later)
-            #connection.sendall(b"hello from peer\n")
-
-        except Exception as e:
-        print(f"[peer {self.id}] handler error: {e}")
-        finally:
-            try:
-                connection.close()
-            except:
-                pass
-        return'''
     def connect_peer(self, connection: socket.socket):
 
         try:
@@ -273,11 +270,9 @@ class Peer:
                 print(f"[peer {self.id}] failed receiving handshake: {e}")
                 return
 
-            total_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
-            self.total_pieces = total_pieces
             has_file = self.peers[self.id][2] == 1
-            bitfield = Bitfield(total_pieces, has_file)
-            self.send_msg(connection, MSG_BITFIELD, bitfield.to_bytes())
+            #bitfield = Bitfield(total_pieces, has_file)
+            self.send_msg(connection, MSG_BITFIELD, self.bitfield.to_bytes())
             self._log(f"Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
 
             while True:
@@ -427,7 +422,8 @@ class Peer:
 
         
 
-    
+##########################################################################################
+#Bitfield Class
 class Bitfield:
     def __init__(self, total_pieces: int, has_all: bool):
         self.bits = [1 if has_all else 0] * total_pieces
@@ -457,6 +453,7 @@ class Bitfield:
         b.bits = bits[:total_pieces]
         return b
 
+#?repeated function, might need to delete
 def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
     if msg_id == MSG_CHOKE:
         self.choked = True
@@ -476,8 +473,8 @@ def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
         self._log(f"Peer [{self.id}] received BITFIELD.")
 
 
-
-
+##########################################################################################
+#Main Function
 if __name__ == "__main__":
     id: int = int(sys.argv[1])
     peer = Peer(id)

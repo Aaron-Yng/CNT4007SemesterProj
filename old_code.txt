@@ -1,0 +1,42 @@
+'''def connect_peer(self, connection: socket.socket):
+        # main func of peer class, main equivalent, does handshake then handles msgs
+        try:
+            my_handshake = build_handshake(self.id)
+            connection.sendall(my_handshake)
+            # read 4 bytes peer id if the dialer sent it; if not present, ignore gracefully
+            try:
+                their_handshake = _recv_exact(connection, 32)
+                other_id = parse_handshake(their_handshake)
+                if other_id is None:
+                    print(f"[peer {self.id}] invalid handshake received")
+                    return
+                self.log_connected_from(other_id)
+                print(f"[peer {self.id}] handshake successfully with peer {other_id}")
+            except Exception as e:
+                print(f"[peer {self.id}] failed receiving handshake: {e}")
+                return
+            
+
+                #connection.settimeout(1.0)
+                #raw = _recv_exact(connection, 4)
+                #other_id = _from_u32(raw)
+                #self.log_connected_from(other_id)
+        except Exception:
+            pass
+        finally:
+            try:
+                connection.settimeout(None)
+            except:
+                pass
+
+            # minimal placeholder so we can see activity now (replace with real handshake later)
+            #connection.sendall(b"hello from peer\n")
+
+        except Exception as e:
+        print(f"[peer {self.id}] handler error: {e}")
+        finally:
+            try:
+                connection.close()
+            except:
+                pass
+        return'''
