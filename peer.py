@@ -70,18 +70,59 @@ class FileManager:
         self.directory = Path(str(pid))
         self.directory.mkdir(exist_ok = True) #create dir if not exist
         self.pieces = [False] * total_pieces #init local bitmap to all false
+        self.data_array = [b""] * total_pieces
         self.lock = threading.Lock() #create a lock to ensure threading safety (blocks till lock is free)
 
         self.load_file() #get pieces and update the local bitmap (piece)
 
-    #IN PROGRESS
+    #loads
     def load_file(self):
         if(self.has_file):
-            #separate entire file into pieces
-            return
+            path = Path(self.directory, self.file_name) #separate entire file into pieces
+            data = path.read_bytes() #get data from file in prep for portioning into pieces
+            for i in range(self.total_pieces):
+                piece_data = data[self.piece_size * i : self.piece_size * (i + 1)]
+                self.data_array[i] = piece_data #store piece data
+                self.pieces[i] = True #mark present
         else:
-            #get current pieces
-            return
+            #load current pieces in dir
+            for i in range(self.total_pieces):
+                path = Path(self.directory, f"piece_{i}")
+                if(path.exists()):
+                    piece_data = path.read_bytes() #just read the piece file, no need for slicing
+                    self.data_array[i] = piece_data
+                    self.pieces[i] = True
+
+    #getter setters
+    def get_piece(self, pnum):
+        return self.data_array[pnum]
+    
+    def set_piece(self, pnum, val):
+        self.data_array[pnum] = val
+        self.pieces[pnum] = True
+
+        #write to dir
+        path = Path(self.directory, f"piece_{pnum}")
+        path.write_bytes(val)
+
+
+    #file assembly
+    def assemble_file(self):
+        fpath = Path(self.directory, self.file_name)
+
+        #open fpath in write binary mode
+        with fpath.open("wb") as f:
+            for i in range(self.total_pieces):
+                f.write(self.data_array[i])
+
+        #delete pieces
+        for i in range(self.total_pieces):
+            piece = Path(self.directory, f"piece_{i}")
+            if piece.exists():
+                piece.unlink()
+        
+        #set has to true
+        self.has_file = True
 
 
 
