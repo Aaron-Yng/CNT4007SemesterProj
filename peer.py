@@ -23,12 +23,15 @@ MSG_BITFIELD = 5
 MSG_REQUEST = 6
 MSG_PIECE = 7
 
+#debug print bool
+debug: bool = False
+
 def build_handshake(peer_id: int) -> bytes:
     return HANDSHAKE_HEADER + HANDSHAKE_PAD + _u32(peer_id)
 
 def parse_handshake(data: bytes) -> int | None:
     if len(data) != 32 or not data.startswith(HANDSHAKE_HEADER):
-        print(f"Bad handshake len={len(data)} data={data}")
+        if debug: print(f"Bad handshake len={len(data)} data={data}")
         return None
     return _from_u32(data[-4:])
     
@@ -113,9 +116,9 @@ class FileManager:
         fpath = Path(self.directory, self.file_name)
     
     # DEBUG
-        print(f"[FileManager] Assembling file to {fpath}")
-        print(f"[FileManager] total_pieces={self.total_pieces}")
-        print(f"[FileManager] data_array lengths: {[len(d) for d in self.data_array[:5]]}...")  # first 5
+        if debug: print(f"[FileManager] Assembling file to {fpath}")
+        if debug: print(f"[FileManager] total_pieces={self.total_pieces}")
+        if debug: print(f"[FileManager] data_array lengths: {[len(d) for d in self.data_array[:5]]}...")  # first 5
     
         total_bytes = 0
         with fpath.open("wb") as f:
@@ -124,7 +127,7 @@ class FileManager:
                 total_bytes += len(chunk)
                 f.write(chunk)
     
-        print(f"[FileManager] Wrote {total_bytes} bytes total")
+        if debug: print(f"[FileManager] Wrote {total_bytes} bytes total")
 
     #delete pieces
         for i in range(self.total_pieces):
@@ -217,7 +220,7 @@ class Peer:
         #calc total_pieces and store as property
         total_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
         self.total_pieces = total_pieces
-        print(f"[peer {self.id}] DEBUG: total_pieces = {total_pieces}")  # ADD THIS
+        if debug: print(f"[peer {self.id}] DEBUG: total_pieces = {total_pieces}")  # ADD THIS
 
 
         self.peer_states = {}
@@ -236,7 +239,7 @@ class Peer:
         # Optimistic unchoke tracking
         self.optimistic_unchoked_peer = None
         #init a local file manager for this peer, accessing self.peers to search for own has status
-        self.file_manager = FileManager(self.id, self.file_name, self.file_size, self.piece_size, self.total_pieces, self.peers[pid][2])
+        self.file_manager = FileManager(self.id, self.file_name, self.file_size, self.piece_size, self.total_pieces, self.peers[self.id][2])
 
         #created dict to store bitfields of other peers 
         self.peer_bitfields: dict[int, Bitfield] = {}
@@ -261,7 +264,7 @@ class Peer:
             sock.sendall(_u32(length) + struct.pack("B", msg_id) + (payload or b""))
         except Exception as e:
             # For midpoint we just print; later we might log/raise
-            print(f"[peer {self.id}] send_msg error: {e}")
+            if debug: print(f"[peer {self.id}] send_msg error: {e}")
 
     def recv_msg(self, sock: socket.socket) -> tuple[int, bytes]:
         hdr = _recv_exact(sock, 4)
@@ -282,7 +285,7 @@ class Peer:
     def begin_listening(self):
         # FIX: use self.id (not builtin id), and fetch tuple (host, port, has)
         if self.id not in self.peers:
-            print(f"[peer {self.id}] not in PeerInfo.cfg; cannot listen.")
+            if debug: print(f"[peer {self.id}] not in PeerInfo.cfg; cannot listen.")
             return
         host, port, has = self.peers[self.id]
 
@@ -292,15 +295,15 @@ class Peer:
         sock.bind((host, int(port)))
 
         sock.listen(int(self.preferred_neighbors))
-        print(f"[peer {self.id}] listening on {host}:{port} (backlog={self.preferred_neighbors})")
+        if debug: print(f"[peer {self.id}] listening on {host}:{port} (backlog={self.preferred_neighbors})")
 
         while True:
             try:
                 connection, addr = sock.accept()
-                print(f"[peer {self.id}] accepted from {addr}")
+                if debug: print(f"[peer {self.id}] accepted from {addr}")
                 Thread(target=self.connect_peer, args=(connection,), daemon=True).start()
             except Exception as e:
-                print(f"[peer {self.id}] accept error: {e}")
+                if debug: print(f"[peer {self.id}] accept error: {e}")
                 break
 
     # connect out to another peer using (host, port) from PeerInfo.cfg
@@ -314,7 +317,7 @@ class Peer:
             # reuse handler (it will still send your 'hello' and close)
             self.connect_peer(s)
         except Exception as e:
-            print(f"[peer {self.id}] dial to {host}:{port} failed: {e}") 
+            if debug: print(f"[peer {self.id}] dial to {host}:{port} failed: {e}") 
 
 
     def connect_peer(self, connection: socket.socket):
@@ -327,15 +330,15 @@ class Peer:
                 their_handshake = _recv_exact(connection, 32)
                 other_id = parse_handshake(their_handshake)
                 if other_id is None:
-                    print(f"[peer {self.id}] invalid handshake received")
+                    if debug: print(f"[peer {self.id}] invalid handshake received")
                     return
                 self.log_connected_from(other_id)
-                print(f"[peer {self.id}] handshake successful with peer {other_id}")
+                if debug: print(f"[peer {self.id}] handshake successful with peer {other_id}")
                 #add to connections
                 self.connections[other_id] = connection
 
             except Exception as e:
-                print(f"[peer {self.id}] failed receiving handshake: {e}")
+                if debug: print(f"[peer {self.id}] failed receiving handshake: {e}")
                 return
 
             has_file = self.peers[self.id][2] == 1
@@ -348,21 +351,21 @@ class Peer:
                     msg_id, payload = self.recv_msg(connection)
                     self.handle_message(msg_id, payload, connection, other_id)
                 except ConnectionError:
-                    print(f"[peer {self.id}] connection closed by peer {other_id}")
+                    if debug: print(f"[peer {self.id}] connection closed by peer {other_id}")
                     break
                 except Exception as e:
-                    print(f"[peer {self.id}] error in message loop: {e}")
+                    if debug: print(f"[peer {self.id}] error in message loop: {e}")
                     break
 
         except Exception as e:
-            print(f"[peer {self.id}] handler error: {e}")
+            if debug: print(f"[peer {self.id}] handler error: {e}")
 
         finally:
             try:
                 connection.close()
             except:
                 pass
-            print(f"[peer {self.id}] closed connection.")
+            if debug: print(f"[peer {self.id}] closed connection.")
 
 
 # log helpers for TCP connection events (simplified versions)
@@ -378,7 +381,7 @@ class Peer:
             with self._log_path().open("a", encoding="utf-8") as f:
                 f.write(f"[{self._timestamp()}]: {line}\n")
         except Exception as e:
-            print(f"[peer {self.id}] log error: {e}")
+            if debug: print(f"[peer {self.id}] log error: {e}")
 
     def log_makes_connection(self, other_id: int) -> None:
         self._log(f"Peer [{self.id}] makes a connection to Peer [{other_id}].")
@@ -390,29 +393,29 @@ class Peer:
         if msg_id == MSG_CHOKE:
             self.peer_states[other_id]["is_choked"] = True
             self._log(f"Peer [{self.id}] is choked by [{other_id}].")
-            print(f"[peer {self.id}] choked by peer {other_id}")
+            if debug: print(f"[peer {self.id}] choked by peer {other_id}")
         
         elif msg_id == MSG_UNCHOKE:
             self.peer_states[other_id]["is_choked"] = False
             self._log(f"Peer [{self.id}] is unchoked by [{other_id}].")
-            print(f"[peer {self.id}] unchoked by peer {other_id}")
+            if debug: print(f"[peer {self.id}] unchoked by peer {other_id}")
             self.request_piece(conn, other_id)
         
         elif msg_id == MSG_INTERESTED:
             self.peer_states[other_id]["interested"] = True
             self._log(f"Peer [{self.id}] received the 'interested' message from [{other_id}].")
-            print(f"[peer {self.id}] received INTERESTED from peer {other_id}")
+            if debug: print(f"[peer {self.id}] received INTERESTED from peer {other_id}")
         
         elif msg_id == MSG_NOT_INTERESTED:
             self.peer_states[other_id]["interested"] = False
             self._log(f"Peer [{self.id}] received the 'not interested' message from [{other_id}].")
-            print(f"[peer {self.id}] received NOT INTERESTED from peer {other_id}")
+            if debug: print(f"[peer {self.id}] received NOT INTERESTED from peer {other_id}")
         
         elif msg_id == MSG_HAVE:
             piece_index = _from_u32(payload)
             self.peer_bitfields[other_id].set_piece(piece_index)
             self._log(f"Peer [{self.id}] received the 'have' message from [{other_id}] for the piece {piece_index}.")
-            print(f"[peer {self.id}] received HAVE for piece {piece_index} from peer {other_id}")
+            if debug: print(f"[peer {self.id}] received HAVE for piece {piece_index} from peer {other_id}")
         
             if not self.bitfield.has_piece(piece_index):
                 self.send_interested(conn, other_id)
@@ -422,8 +425,8 @@ class Peer:
                 
         elif msg_id == MSG_BITFIELD:
             self.peer_bitfields[other_id] = Bitfield.from_bytes(payload, self.total_pieces)
-            print(f"[peer {self.id}] DEBUG: received bitfield with {sum(self.peer_bitfields[other_id].bits)} pieces set out of {self.total_pieces}")
-            print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id].bits[:8]}...")
+            if debug: print(f"[peer {self.id}] DEBUG: received bitfield with {sum(self.peer_bitfields[other_id].bits)} pieces set out of {self.total_pieces}")
+            if debug: print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id].bits[:8]}...")
             self._log(f"Peer [{self.id}] received BITFIELD from [{other_id}].")
             if self._has_interesting_pieces(other_id):
                 self.send_interested(conn, other_id)
@@ -432,15 +435,15 @@ class Peer:
             
         elif msg_id == MSG_REQUEST:
             piece_index = _from_u32(payload)
-            print(f"[peer {self.id}] received REQUEST for piece {piece_index} from peer {other_id}")
+            if debug: print(f"[peer {self.id}] received REQUEST for piece {piece_index} from peer {other_id}")
         
             if not self.peer_states[other_id]["choked"] and self.bitfield.has_piece(piece_index):
                 piece_data = self.file_manager.get_piece(piece_index)
                 piece_payload = _u32(piece_index) + piece_data
                 self.send_msg(conn, MSG_PIECE, piece_payload)
-                print(f"[peer {self.id}] sent PIECE {piece_index} to peer {other_id}")
+                if debug: print(f"[peer {self.id}] sent PIECE {piece_index} to peer {other_id}")
             else:
-                print(f"[peer {self.id}] denied REQUEST for piece {piece_index} (choked or don't have)")
+                if debug: print(f"[peer {self.id}] denied REQUEST for piece {piece_index} (choked or don't have)")
             
         elif msg_id == MSG_PIECE:
             piece_index = _from_u32(payload[:4])
@@ -455,14 +458,14 @@ class Peer:
             num_pieces = sum(self.bitfield.bits)
         
             self._log(f"Peer [{self.id}] has downloaded the piece {piece_index} from [{other_id}]. Now the number of pieces it has is {num_pieces}.")
-            print(f"[peer {self.id}] received PIECE {piece_index} from peer {other_id}. Total pieces: {num_pieces}")
+            if debug: print(f"[peer {self.id}] received PIECE {piece_index} from peer {other_id}. Total pieces: {num_pieces}")
         
             self.broadcast_have(piece_index)
         
             if num_pieces == self.total_pieces:
                 self.file_manager.assemble_file()
                 self._log(f"Peer [{self.id}] has downloaded the complete file.")
-                print(f"[peer {self.id}] COMPLETE FILE DOWNLOADED!")
+                if debug: print(f"[peer {self.id}] COMPLETE FILE DOWNLOADED!")
             else:
                 if not self.peer_states[other_id]["is_choked"]:
                     self.request_piece(conn, other_id)
@@ -487,22 +490,22 @@ class Peer:
                 available_pieces.append(i)
     
         if not available_pieces:
-            print(f"[peer {self.id}] no pieces to request from peer {other_id}")
+            if debug: print(f"[peer {self.id}] no pieces to request from peer {other_id}")
             return
         
         piece_index = random.choice(available_pieces)
     
         self.send_msg(conn, MSG_REQUEST, _u32(piece_index))
         self._log(f"Peer [{self.id}] requested piece {piece_index} from [{other_id}].")
-        print(f"[peer {self.id}] sent REQUEST for piece {piece_index} to peer {other_id}")
+        if debug: print(f"[peer {self.id}] sent REQUEST for piece {piece_index} to peer {other_id}")
 
     def broadcast_have(self, piece_index: int):
         for pid, conn in self.connections.items():
             try:
                 self.send_msg(conn, MSG_HAVE, _u32(piece_index))
-                print(f"[peer {self.id}] sent HAVE for piece {piece_index} to peer {pid}")
+                if debug: print(f"[peer {self.id}] sent HAVE for piece {piece_index} to peer {pid}")
             except Exception as e:
-                print(f"[peer {self.id}] failed to send HAVE to peer {pid}: {e}")
+                if debug: print(f"[peer {self.id}] failed to send HAVE to peer {pid}: {e}")
 
 
     def record_download(self, from_peer: int, num_bytes: int):
@@ -526,13 +529,13 @@ class Peer:
         self.send_msg(conn, MSG_INTERESTED)
         self.peer_states[other_id]["is_interested"] = True
         self._log(f"Peer [{self.id}] sent 'interested' to [{other_id}].")
-        print(f"[peer {self.id}] sent INTERESTED to peer {other_id}")
+        if debug: print(f"[peer {self.id}] sent INTERESTED to peer {other_id}")
 
     def send_not_interested(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_NOT_INTERESTED)
         self.peer_states[other_id]["is_interested"] = False
         self._log(f"Peer [{self.id}] sent 'not interested' to [{other_id}].")
-        print(f"[peer {self.id}] sent NOT INTERESTED to peer {other_id}")
+        if debug: print(f"[peer {self.id}] sent NOT INTERESTED to peer {other_id}")
 
     def send_request(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_REQUEST)
@@ -554,7 +557,7 @@ class Peer:
         ]
         
         if not interested_peers:
-            print(f"[peer {self.id}] no interested peers to unchoke")
+            if debug: print(f"[peer {self.id}] no interested peers to unchoke")
             return
         
         # Determine preferred peers
@@ -589,7 +592,7 @@ class Peer:
         
         # Log preferred neighbors
         self._log(f"Peer [{self.id}] has the preferred neighbors {','.join(map(str, preferred_peers))}.")
-        print(f"[peer {self.id}] preferred neighbors: {preferred_peers}")
+        if debug: print(f"[peer {self.id}] preferred neighbors: {preferred_peers}")
         
         # Unchoke preferred, choke others (but not optimistic unchoke)
         for pid in list(self.connections.keys()):
@@ -618,7 +621,7 @@ class Peer:
         ]
         
         if not candidates:
-            print(f"[peer {self.id}] no candidates for optimistic unchoke")
+            if debug: print(f"[peer {self.id}] no candidates for optimistic unchoke")
             return
         
         # Randomly select one
@@ -629,7 +632,7 @@ class Peer:
         self.unchoke_peer(self.connections[selected], selected)
         
         self._log(f"Peer [{self.id}] has the optimistically unchoked neighbor {selected}.")
-        print(f"[peer {self.id}] optimistically unchoked: {selected}")
+        if debug: print(f"[peer {self.id}] optimistically unchoked: {selected}")
 
         
 
@@ -683,7 +686,7 @@ def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket):
         self._log(f"Peer [{self.id}] received NOT INTERESTED.")
     elif msg_id == MSG_BITFIELD:
         other_bf = Bitfield.from_bytes(payload, self.total_pieces)
-        print(f"[peer {self.id}] received bitfield {other_bf.bits[:8]}...")
+        if debug: print(f"[peer {self.id}] received bitfield {other_bf.bits[:8]}...")
         self._log(f"Peer [{self.id}] received BITFIELD.")
 
 
@@ -716,4 +719,4 @@ if __name__ == "__main__":
         while True:
             pass   # keep running; Ctrl+C to stop
     except KeyboardInterrupt:
-        print(f"[peer {id}] exiting")
+        if debug: print(f"[peer {id}] exiting")
