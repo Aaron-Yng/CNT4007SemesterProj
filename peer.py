@@ -67,6 +67,8 @@ class FileManager:
         self.total_pieces = total_pieces
         self.has_file = has_file
 
+
+        
         self.directory = Path(str(pid))
         self.directory.mkdir(exist_ok = True) #create dir if not exist
         self.pieces = [False] * total_pieces #init local bitmap to all false
@@ -109,19 +111,27 @@ class FileManager:
     #file assembly
     def assemble_file(self):
         fpath = Path(self.directory, self.file_name)
-
-        #open fpath in write binary mode
+    
+    # DEBUG
+        print(f"[FileManager] Assembling file to {fpath}")
+        print(f"[FileManager] total_pieces={self.total_pieces}")
+        print(f"[FileManager] data_array lengths: {[len(d) for d in self.data_array[:5]]}...")  # first 5
+    
+        total_bytes = 0
         with fpath.open("wb") as f:
             for i in range(self.total_pieces):
-                f.write(self.data_array[i])
+                chunk = self.data_array[i]
+                total_bytes += len(chunk)
+                f.write(chunk)
+    
+        print(f"[FileManager] Wrote {total_bytes} bytes total")
 
-        #delete pieces
+    #delete pieces
         for i in range(self.total_pieces):
             piece = Path(self.directory, f"piece_{i}")
             if piece.exists():
                 piece.unlink()
-        
-        #set has to true
+    
         self.has_file = True
 
 
@@ -207,9 +217,26 @@ class Peer:
         #calc total_pieces and store as property
         total_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
         self.total_pieces = total_pieces
-                
+        print(f"[peer {self.id}] DEBUG: total_pieces = {total_pieces}")  # ADD THIS
+
+
+        self.peer_states = {}
+        for pid in self.peers.keys():
+            self.peer_states[pid] = {
+                "choked": True,
+                "interested": False,
+                "is_choked": True, #self is choked by other
+                "is_interested": False
+            }        
+
+        # Download tracking - bytes received from each peer in current interval
+        self.download_counts = {}
+        self.download_lock = threading.Lock()
+        
+        # Optimistic unchoke tracking
+        self.optimistic_unchoked_peer = None
         #init a local file manager for this peer, accessing self.peers to search for own has status
-        self.file_manager = FileManager(pid, self.file_name, self.file_size, self.piece_size, self.total_pieces, self.peers[pid][2])
+        self.file_manager = FileManager(self.id, self.file_name, self.file_size, self.piece_size, self.total_pieces, self.peers[pid][2])
 
         #created dict to store bitfields of other peers 
         self.peer_bitfields: dict[int, Bitfield] = {}
@@ -395,6 +422,7 @@ class Peer:
                 
         elif msg_id == MSG_BITFIELD:
             self.peer_bitfields[other_id] = Bitfield.from_bytes(payload, self.total_pieces)
+            print(f"[peer {self.id}] DEBUG: received bitfield with {sum(self.peer_bitfields[other_id].bits)} pieces set out of {self.total_pieces}")
             print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id].bits[:8]}...")
             self._log(f"Peer [{self.id}] received BITFIELD from [{other_id}].")
             if self._has_interesting_pieces(other_id):
@@ -418,6 +446,8 @@ class Peer:
             piece_index = _from_u32(payload[:4])
             piece_data = payload[4:]
         
+            self.record_download(other_id, len(piece_data))
+
             with self.file_manager.lock:
                 self.file_manager.set_piece(piece_index, piece_data)
                 self.bitfield.set_piece(piece_index)
@@ -443,6 +473,9 @@ class Peer:
         other_bits = self.peer_bitfields[other_id].bits
         my_bits = self.bitfield.bits
         return any(my == 0 and their == 1 for my, their in zip(my_bits, other_bits))
+    
+    def _has_complete_file(self) -> bool:
+        return all(self.bitfield.bits)
     
     def request_piece(self, conn: socket.socket, other_id: int):
         if other_id not in self.peer_bitfields:
@@ -471,6 +504,14 @@ class Peer:
             except Exception as e:
                 print(f"[peer {self.id}] failed to send HAVE to peer {pid}: {e}")
 
+
+    def record_download(self, from_peer: int, num_bytes: int):
+        with self.download_lock:
+            if from_peer not in self.download_counts:
+                self.download_counts[from_peer] = 0
+            self.download_counts[from_peer] += num_bytes
+
+
     def choke_peer(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_CHOKE)
         self.peer_states[other_id]["choked"] = True
@@ -497,30 +538,98 @@ class Peer:
         self.send_msg(conn, MSG_REQUEST)
         self._log(f"Peer [{self.id}] has downloaded the piece TBD from [{other_id}]")
 
-    def choke_unchoke(self):
-        #stop time for unchoking interval
-        time.sleep(self.unchoking_interval)
+    def start_choke_unchoke_loop(self):
+        """Periodically select preferred neighbors."""
+        while True:
+            time.sleep(self.unchoking_interval)
+            self.select_preferred_neighbors()
 
-        #get list of interested peers using list comprehension
-        interested_peers = [pid for pid, vec in self.peer_states.items() if vec["interested"]]
-
-        #get 'num = preferred neighbors' random set of interested peers, all interested peers if num interested is < num preferred
-        preferred_peers = random.sample(interested_peers, min(self.preferred_neighbors, len(interested_peers)))
-
-        for pid in self.peer_states:
+    def select_preferred_neighbors(self):
+        """Select and unchoke preferred neighbors based on download rate."""
+        
+        # Get interested peers that we have connections to
+        interested_peers = [
+            pid for pid, state in self.peer_states.items()
+            if state["interested"] and pid in self.connections
+        ]
+        
+        if not interested_peers:
+            print(f"[peer {self.id}] no interested peers to unchoke")
+            return
+        
+        # Determine preferred peers
+        if self._has_complete_file():
+            # Random selection if we have complete file
+            num_to_select = min(self.preferred_neighbors, len(interested_peers))
+            preferred_peers = random.sample(interested_peers, num_to_select)
+        else:
+            # Select by download rate
+            with self.download_lock:
+                # Sort by download rate (descending)
+                rates = [(pid, self.download_counts.get(pid, 0)) for pid in interested_peers]
+                rates.sort(key=lambda x: x[1], reverse=True)
+                
+                # Handle ties randomly - group by rate, shuffle within groups
+                grouped = {}
+                for pid, rate in rates:
+                    if rate not in grouped:
+                        grouped[rate] = []
+                    grouped[rate].append(pid)
+                
+                sorted_peers = []
+                for rate in sorted(grouped.keys(), reverse=True):
+                    peers_at_rate = grouped[rate]
+                    random.shuffle(peers_at_rate)
+                    sorted_peers.extend(peers_at_rate)
+                
+                preferred_peers = sorted_peers[:self.preferred_neighbors]
+                
+                # Reset download counts for next interval
+                self.download_counts.clear()
+        
+        # Log preferred neighbors
+        self._log(f"Peer [{self.id}] has the preferred neighbors {','.join(map(str, preferred_peers))}.")
+        print(f"[peer {self.id}] preferred neighbors: {preferred_peers}")
+        
+        # Unchoke preferred, choke others (but not optimistic unchoke)
+        for pid in list(self.connections.keys()):
             if pid in preferred_peers:
-                self.peer_states[pid]["choked"] = False
-
-                #check if connection exists and if it does then send msg to unchoke
-                if self.connections[pid]:
+                if self.peer_states[pid]["choked"]:
                     self.unchoke_peer(self.connections[pid], pid)
             else:
-                #must choke if not in preferred so num of peers currently unchoked doesn't exceed the preferred neighbors
-                self.peer_states[pid]["choked"] = True
+                # Don't choke the optimistically unchoked peer
+                if pid != self.optimistic_unchoked_peer:
+                    if not self.peer_states[pid]["choked"]:
+                        self.choke_peer(self.connections[pid], pid)
 
-                #chokes if connection exists
-                if self.connections[pid]:
-                    self.choke_peer(self.connections[pid], pid)
+    def start_optimistic_unchoke_loop(self):
+        """Periodically select optimistically unchoked neighbor."""
+        while True:
+            time.sleep(self.optimistic_interval)
+            self.select_optimistic_unchoke()
+
+    def select_optimistic_unchoke(self):
+        """Randomly select one choked but interested peer to unchoke."""
+        
+        # Find choked but interested peers
+        candidates = [
+            pid for pid, state in self.peer_states.items()
+            if state["choked"] and state["interested"] and pid in self.connections
+        ]
+        
+        if not candidates:
+            print(f"[peer {self.id}] no candidates for optimistic unchoke")
+            return
+        
+        # Randomly select one
+        selected = random.choice(candidates)
+        self.optimistic_unchoked_peer = selected
+        
+        # Unchoke them
+        self.unchoke_peer(self.connections[selected], selected)
+        
+        self._log(f"Peer [{self.id}] has the optimistically unchoked neighbor {selected}.")
+        print(f"[peer {self.id}] optimistically unchoked: {selected}")
 
         
 
@@ -540,8 +649,11 @@ class Bitfield:
         out = bytearray()
         for i in range(0, len(self.bits), 8):
             byte = 0
-            for bit in self.bits[i:i+8]:
+            chunk = self.bits[i:i+8]
+            for bit in chunk:
                 byte = (byte << 1) | bit
+        # Pad with zeros if last chunk is less than 8 bits
+            byte <<= (8 - len(chunk))
             out.append(byte)
         return bytes(out)
 
@@ -585,6 +697,13 @@ if __name__ == "__main__":
     # Thread(target= self.begin_listening, daemon= True)
     t = Thread(target= peer.begin_listening, daemon= True)
     t.start()
+
+    unchoke_thread = Thread(target=peer.start_choke_unchoke_loop, daemon=True)
+    unchoke_thread.start()
+    
+    # Start optimistic unchoke loop
+    optimistic_thread = Thread(target=peer.start_optimistic_unchoke_loop, daemon=True)
+    optimistic_thread.start()
     
     # autoconnector 
     for pid, info in peer.peers.items():
