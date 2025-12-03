@@ -1,7 +1,6 @@
 import socket
 import threading
 from threading import Thread
-import pathlib
 from pathlib import Path
 import sys
 import struct
@@ -270,6 +269,50 @@ class Peer:
         self.global_requests = set()
         self.pending_requests = {}
 
+        # log startup configuration for demo/video
+        self._log_startup_config()
+
+    # ---------------------------------------------------------------------
+    # Startup config logging (for video presentation + debugging)
+    # ---------------------------------------------------------------------
+    def _log_startup_config(self):
+        """
+        Log the key configuration and initial state when a peer starts.
+        This is great to show in the demo/video.
+        """
+        self._log(
+            f"STARTUP: Peer [{self.id}] loaded Common.cfg with "
+            f"NumberOfPreferredNeighbors={getattr(self, 'preferred_neighbors', 'NA')}, "
+            f"UnchokingInterval={getattr(self, 'unchoking_interval', 'NA')}s, "
+            f"OptimisticUnchokingInterval={getattr(self, 'optimistic_interval', 'NA')}s, "
+            f"FileName='{getattr(self, 'file_name', '')}', "
+            f"FileSize={getattr(self, 'file_size', 0)} bytes, "
+            f"PieceSize={getattr(self, 'piece_size', 0)} bytes, "
+            f"TotalPieces={self.total_pieces}."
+        )
+
+        # Print PeerInfo summary
+        for pid, (host, port, has) in self.peers.items():
+            self._log(
+                f"CONFIG: PeerInfo entry -> Peer [{pid}] at {host}:{port}, hasFile={has}."
+            )
+
+        # Initial bitfield preview
+        preview_len = min(32, self.total_pieces)
+        bit_preview = "".join(str(b) for b in self.bitfield.bits[:preview_len])
+        self._log(
+            f"INITIAL BITFIELD: Peer [{self.id}] first {preview_len} pieces = {bit_preview}"
+        )
+
+        has_file_flag = self.peers[self.id][2]
+        self._log(
+            f"INITIAL STATE: Peer [{self.id}] has_file={bool(has_file_flag)}, "
+            f"completed[{self.id}]={self.completed[self.id]}."
+        )
+
+    # ---------------------------------------------------------------------
+    # Messaging + networking
+    # ---------------------------------------------------------------------
     def send_msg(self, sock: socket.socket, msg_id: int, payload: bytes = b"") -> None:
         try:
             length = 1 + (len(payload) if payload else 0)
@@ -292,8 +335,7 @@ class Peer:
     def begin_listening(self):
         # use self.id and PeerInfo.cfg
         if self.id not in self.peers:
-            if debug:
-                print(f"[peer {self.id}] not in PeerInfo.cfg; cannot listen.")
+            self._log(f"ERROR: Peer [{self.id}] not in PeerInfo.cfg; cannot listen.")
             return
         host, port, has = self.peers[self.id]
 
@@ -303,31 +345,38 @@ class Peer:
         sock.bind((host, int(port)))
         sock.listen(int(self.preferred_neighbors))
 
-        if debug:
-            print(f"[peer {self.id}] listening on {host}:{port} (backlog={self.preferred_neighbors})")
+        self._log(
+            f"LISTEN: Peer [{self.id}] listening on {host}:{port} "
+            f"(backlog={self.preferred_neighbors})."
+        )
 
         while True:
             try:
                 connection, addr = sock.accept()
-                if debug:
-                    print(f"[peer {self.id}] accepted from {addr}")
+                self._log(
+                    f"ACCEPT: Peer [{self.id}] accepted inbound TCP connection from {addr}."
+                )
                 Thread(target=self.connect_peer, args=(connection,), daemon=True).start()
             except Exception as e:
-                if debug:
-                    print(f"[peer {self.id}] accept error: {e}")
+                self._log(f"ACCEPT ERROR: {e}")
                 break
 
     # connect out to another peer using (host, port) from PeerInfo.cfg
     def dial_peer(self, host: str, port: int, remote_id: int):
         try:
-            s = socket.create_connection((host, int(port)), timeout=3)
-            # log: we (self.id) make a connection to remote_id
             self.log_makes_connection(remote_id)
+            s = socket.create_connection((host, int(port)), timeout=3)
+            self._log(
+                f"TCP CONNECTION BUILT: Peer [{self.id}] connected to Peer [{remote_id}] "
+                f"at {host}:{port}."
+            )
             # reuse handler
             self.connect_peer(s)
         except Exception as e:
-            if debug:
-                print(f"[peer {self.id}] dial to {host}:{port} failed: {e}")
+            self._log(
+                f"DIAL ERROR: Peer [{self.id}] failed to connect to Peer [{remote_id}] "
+                f"at {host}:{port}. Error={e}"
+            )
 
     def connect_peer(self, connection: socket.socket):
         try:
@@ -410,11 +459,14 @@ class Peer:
         print(f"[peer {self.id}] {formatted}")
 
     def log_makes_connection(self, other_id: int) -> None:
-        self._log(f"Peer [{self.id}] makes a connection to Peer [{other_id}].")
+        self._log(f"PLAN: Peer [{self.id}] will make a connection to Peer [{other_id}].")
 
     def log_connected_from(self, other_id: int) -> None:
         self._log(f"Peer [{self.id}] is connected from Peer [{other_id}].")
 
+    # ---------------------------------------------------------------------
+    # Message handling
+    # ---------------------------------------------------------------------
     def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket, other_id: int):
         if msg_id == MSG_CHOKE:
             self.peer_states[other_id]["is_choked"] = True
@@ -825,6 +877,9 @@ if __name__ == "__main__":
     id: int = int(sys.argv[1])
     peer = Peer(id)
 
+    # Nice extra log for the beginning of the demo
+    peer._log(f"PROCESS START: Peer [{id}] is up and running.")
+
     # listener
     t = Thread(target=peer.begin_listening, daemon=True)
     t.start()
@@ -845,7 +900,6 @@ if __name__ == "__main__":
 
     try:
         while True:
-            pass   # keep running; Ctrl+C to stop
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        if debug:
-            print(f"[peer {id}] exiting")
+        peer._log(f"MANUAL EXIT: Peer [{id}] received KeyboardInterrupt and is exiting.")
