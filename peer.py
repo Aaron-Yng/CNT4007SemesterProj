@@ -148,6 +148,8 @@ class Peer:
     def __init__(self, id: int):
         self.id = id
 
+        self.log_lock = threading.Lock()
+
         # create path objects for files
         common: Path = Path("Common.cfg")
         peer_info: Path = Path("PeerInfo.cfg")
@@ -396,12 +398,13 @@ class Peer:
         formatted = f"[{ts}] {line}"
 
         # write to log file
-        try:
-            with self._log_path().open("a", encoding="utf-8") as f:
-                f.write(formatted + "\n")
-        except Exception as e:
-            if debug:
-                print(f"[peer {self.id}] log error: {e}")
+        with self.log_lock:
+            try:
+                with self._log_path().open("a", encoding="utf-8") as f:
+                    f.write(formatted + "\n")
+            except Exception as e:
+                if debug:
+                    print(f"[peer {self.id}] log error: {e}")
 
         # mirror to console
         print(f"[peer {self.id}] {formatted}")
