@@ -361,54 +361,115 @@ class Peer:
 
     def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket, other_id: int):
         if msg_id == MSG_CHOKE:
-            self.peer_states[self.id]["choked"] = True
-            self._log(f"Peer [{self.id}] received CHOKE.")
+            self.peer_states[other_id]["is_choked"] = True
+            self._log(f"Peer [{self.id}] is choked by [{other_id}].")
+            print(f"[peer {self.id}] choked by peer {other_id}")
+        
         elif msg_id == MSG_UNCHOKE:
-            self.peer_states[self.id]["choked"] = False
-            self._log(f"Peer [{self.id}] received UNCHOKE.")
+            self.peer_states[other_id]["is_choked"] = False
+            self._log(f"Peer [{self.id}] is unchoked by [{other_id}].")
+            print(f"[peer {self.id}] unchoked by peer {other_id}")
+            self.request_piece(conn, other_id)
+        
         elif msg_id == MSG_INTERESTED:
-            self.peer_states[self.id]["interested"] = True
-            self._log(f"Peer [{self.id}] received INTERESTED.")
+            self.peer_states[other_id]["interested"] = True
+            self._log(f"Peer [{self.id}] received the 'interested' message from [{other_id}].")
+            print(f"[peer {self.id}] received INTERESTED from peer {other_id}")
+        
         elif msg_id == MSG_NOT_INTERESTED:
-            self.peer_states[self.id]["interested"] = False
-            self._log(f"Peer [{self.id}] received NOT INTERESTED.")
+            self.peer_states[other_id]["interested"] = False
+            self._log(f"Peer [{self.id}] received the 'not interested' message from [{other_id}].")
+            print(f"[peer {self.id}] received NOT INTERESTED from peer {other_id}")
+        
         elif msg_id == MSG_HAVE:
-            #calls after request
-            #set piece in other bitfield
             piece_index = _from_u32(payload)
             self.peer_bitfields[other_id].set_piece(piece_index)
-
-            #check if interested
-            if self.bitfield.has_piece(piece_index):
-                #already has the piece
-                self.send_not_interested(conn)
+            self._log(f"Peer [{self.id}] received the 'have' message from [{other_id}] for the piece {piece_index}.")
+            print(f"[peer {self.id}] received HAVE for piece {piece_index} from peer {other_id}")
+        
+            if not self.bitfield.has_piece(piece_index):
+                self.send_interested(conn, other_id)
             else:
-                #doesn't have piece, is interested
-                self.send_interested(conn)
+                if not self._has_interesting_pieces(other_id):
+                    self.send_not_interested(conn, other_id)
+                
         elif msg_id == MSG_BITFIELD:
             self.peer_bitfields[other_id] = Bitfield.from_bytes(payload, self.total_pieces)
-            print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id][:8]}...")
-            self._log(f"Peer [{self.id}] received BITFIELD.")
-
-            if hasattr(self, "bitfield"):
-                interested = any(
-                    my_bit == 0 and their_bit == 1
-                    for my_bit, their_bit in zip(self.bitfield.bits, self.peer_bitfields[other_id].bits)
-                )
-                if interested:
-                    self.send_interested(conn)
-                else:
-                    self.send_not_interested(conn)
+            print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id].bits[:8]}...")
+            self._log(f"Peer [{self.id}] received BITFIELD from [{other_id}].")
+            if self._has_interesting_pieces(other_id):
+                self.send_interested(conn, other_id)
+            else:
+                self.send_not_interested(conn, other_id)
+            
         elif msg_id == MSG_REQUEST:
-            #requests transfer of certain piece after being unchoked
-            #prevent request if currently choked else execute
-            if not self.peer_states[self.id]["choked"]:
-                self.send_request(conn, other_id)
-            self._log()
+            piece_index = _from_u32(payload)
+            print(f"[peer {self.id}] received REQUEST for piece {piece_index} from peer {other_id}")
+        
+            if not self.peer_states[other_id]["choked"] and self.bitfield.has_piece(piece_index):
+                piece_data = self.file_manager.get_piece(piece_index)
+                piece_payload = _u32(piece_index) + piece_data
+                self.send_msg(conn, MSG_PIECE, piece_payload)
+                print(f"[peer {self.id}] sent PIECE {piece_index} to peer {other_id}")
+            else:
+                print(f"[peer {self.id}] denied REQUEST for piece {piece_index} (choked or don't have)")
+            
         elif msg_id == MSG_PIECE:
-            #sends payload of 4 byte piece
-            #temporary log to prevent error msg
-            self._log()
+            piece_index = _from_u32(payload[:4])
+            piece_data = payload[4:]
+        
+            with self.file_manager.lock:
+                self.file_manager.set_piece(piece_index, piece_data)
+                self.bitfield.set_piece(piece_index)
+        
+            num_pieces = sum(self.bitfield.bits)
+        
+            self._log(f"Peer [{self.id}] has downloaded the piece {piece_index} from [{other_id}]. Now the number of pieces it has is {num_pieces}.")
+            print(f"[peer {self.id}] received PIECE {piece_index} from peer {other_id}. Total pieces: {num_pieces}")
+        
+            self.broadcast_have(piece_index)
+        
+            if num_pieces == self.total_pieces:
+                self.file_manager.assemble_file()
+                self._log(f"Peer [{self.id}] has downloaded the complete file.")
+                print(f"[peer {self.id}] COMPLETE FILE DOWNLOADED!")
+            else:
+                if not self.peer_states[other_id]["is_choked"]:
+                    self.request_piece(conn, other_id)
+
+    def _has_interesting_pieces(self, other_id: int) -> bool:
+        if other_id not in self.peer_bitfields:
+            return False
+        other_bits = self.peer_bitfields[other_id].bits
+        my_bits = self.bitfield.bits
+        return any(my == 0 and their == 1 for my, their in zip(my_bits, other_bits))
+    
+    def request_piece(self, conn: socket.socket, other_id: int):
+        if other_id not in self.peer_bitfields:
+            return
+        available_pieces = []
+        for i in range(self.total_pieces):
+            if (self.peer_bitfields[other_id].has_piece(i) and 
+                not self.bitfield.has_piece(i)):
+                available_pieces.append(i)
+    
+        if not available_pieces:
+            print(f"[peer {self.id}] no pieces to request from peer {other_id}")
+            return
+        
+        piece_index = random.choice(available_pieces)
+    
+        self.send_msg(conn, MSG_REQUEST, _u32(piece_index))
+        self._log(f"Peer [{self.id}] requested piece {piece_index} from [{other_id}].")
+        print(f"[peer {self.id}] sent REQUEST for piece {piece_index} to peer {other_id}")
+
+    def broadcast_have(self, piece_index: int):
+        for pid, conn in self.connections.items():
+            try:
+                self.send_msg(conn, MSG_HAVE, _u32(piece_index))
+                print(f"[peer {self.id}] sent HAVE for piece {piece_index} to peer {pid}")
+            except Exception as e:
+                print(f"[peer {self.id}] failed to send HAVE to peer {pid}: {e}")
 
     def choke_peer(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_CHOKE)
@@ -422,15 +483,15 @@ class Peer:
 
     def send_interested(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_INTERESTED)
-        self.peer_states[other_id]["interested"] = True
-        self._log(f"Peer [{self.id}] sent 'interested'.")
-        print(f"[peer {self.id}] sent INTERESTED.")
+        self.peer_states[other_id]["is_interested"] = True
+        self._log(f"Peer [{self.id}] sent 'interested' to [{other_id}].")
+        print(f"[peer {self.id}] sent INTERESTED to peer {other_id}")
 
     def send_not_interested(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_NOT_INTERESTED)
-        self.peer_states[other_id]["interested"] = False
-        self._log(f"Peer [{self.id}] sent 'not interested'.")
-        print(f"[peer {self.id}] sent NOT INTERESTED.")
+        self.peer_states[other_id]["is_interested"] = False
+        self._log(f"Peer [{self.id}] sent 'not interested' to [{other_id}].")
+        print(f"[peer {self.id}] sent NOT INTERESTED to peer {other_id}")
 
     def send_request(self, conn: socket.socket, other_id):
         self.send_msg(conn, MSG_REQUEST)
