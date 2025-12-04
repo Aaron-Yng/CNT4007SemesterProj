@@ -382,64 +382,65 @@ class Peer:
             )
 
     def connect_peer(self, connection: socket.socket):
-        if other_id in self.connections:
-            try:
-                connection.close()
-            except:
-                pass
-            return
-
         try:
-            my_handshake = build_handshake(self.id)
-            connection.sendall(my_handshake)
+            connection.sendall(build_handshake(self.id))
 
+            #receive handshake
             try:
                 their_handshake = _recv_exact(connection, 32)
                 other_id = parse_handshake(their_handshake)
                 if other_id is None:
                     if debug:
                         print(f"[peer {self.id}] invalid handshake received")
+                    connection.close()
                     return
-                self.log_connected_from(other_id)
-                if debug:
-                    print(f"[peer {self.id}] handshake successful with peer {other_id}")
-                # add to connections
-                self.connections[other_id] = connection
-
             except Exception as e:
                 if debug:
                     print(f"[peer {self.id}] failed receiving handshake: {e}")
+                connection.close()
                 return
 
-            # send BITFIELD only if we have at least one piece
+            #check for duplicate
+            if other_id in self.connections:
+                #close new connection if already exists
+                try:
+                    connection.close()
+                except:
+                    pass
+                return
+
+            #log n store connection
+            self.log_connected_from(other_id)
+            self.connections[other_id] = connection
+
+            if debug:
+                print(f"[peer {self.id}] handshake successful with peer {other_id}")
+
+            #send bitfield if have pieces
             if any(self.bitfield.bits):
                 self.send_msg(connection, MSG_BITFIELD, self.bitfield.to_bytes())
                 self._log(f"Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
 
+            #enter loop
             while True:
                 try:
                     msg_id, payload = self.recv_msg(connection)
                     self.handle_message(msg_id, payload, connection, other_id)
                 except ConnectionError:
-                    if debug:
-                        print(f"[peer {self.id}] connection closed by peer {other_id}")
                     break
                 except Exception as e:
                     if debug:
                         print(f"[peer {self.id}] error in message loop: {e}")
                     break
 
-        except Exception as e:
-            if debug:
-                print(f"[peer {self.id}] handler error: {e}")
-
         finally:
             try:
                 connection.close()
             except:
                 pass
-            if debug:
-                print(f"[peer {self.id}] closed connection.")
+            if other_id in self.connections and self.connections[other_id] is connection:
+                del self.connections[other_id]
+
 
     # log helpers
     def _log_path(self) -> Path:
