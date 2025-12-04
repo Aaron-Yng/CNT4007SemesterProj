@@ -3,6 +3,7 @@
 ## Group Members:
 Aaron Young, Asrith Yerramesetty, Nicholas Tayag
 
+## Video Link: https://uflorida-my.sharepoint.com/:v:/r/personal/nicholas_tayag_ufl_edu/Documents/CNT4007%20ProjectGroup44%20-%20Made%20with%20Clipchamp.mp4?csf=1&web=1&nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=sp0SmY
 
 ## We met all requirements! Including hosting on multiple devices (demonstration in video)
 
