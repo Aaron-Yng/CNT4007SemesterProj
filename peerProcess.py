@@ -4,7 +4,6 @@ from threading import Thread
 from pathlib import Path
 import sys
 import struct
-import math
 import random
 import time
 
@@ -21,7 +20,7 @@ MSG_HAVE = 4
 MSG_BITFIELD = 5
 MSG_REQUEST = 6
 MSG_PIECE = 7
-MSG_COMPLETE = 8  # new: completion notification
+MSG_COMPLETE = 8  # completion notification
 
 # debug print bool
 debug: bool = False
@@ -62,8 +61,8 @@ def _from_u32(b: bytes) -> int:
 
 ##########################################################################################
 # File Manager Class
+##########################################################################################
 class FileManager:
-    # constructor
     # assuming project only handles 1 file, so will store file specs including name in file manager itself
     def __init__(self, pid: int, file_name: str, file_size: int, piece_size: int, total_pieces: int, has_file: bool):
         self.pid = pid
@@ -81,7 +80,6 @@ class FileManager:
 
         self.load_file()  # get pieces and update the local bitmap (piece)
 
-    # loads
     def load_file(self):
         if self.has_file:
             path = Path(self.directory, self.file_name)  # separate entire file into pieces
@@ -99,11 +97,10 @@ class FileManager:
                     self.data_array[i] = piece_data
                     self.pieces[i] = True
 
-    # getter setters
-    def get_piece(self, pnum):
+    def get_piece(self, pnum: int) -> bytes:
         return self.data_array[pnum]
 
-    def set_piece(self, pnum, val):
+    def set_piece(self, pnum: int, val: bytes):
         self.data_array[pnum] = val
         self.pieces[pnum] = True
 
@@ -111,11 +108,9 @@ class FileManager:
         path = Path(self.directory, f"piece_{pnum}")
         path.write_bytes(val)
 
-    # file assembly
     def assemble_file(self):
         fpath = Path(self.directory, self.file_name)
 
-        # DEBUG
         if debug:
             print(f"[FileManager] Assembling file to {fpath}")
             print(f"[FileManager] total_pieces={self.total_pieces}")
@@ -142,8 +137,8 @@ class FileManager:
 
 ##########################################################################################
 # Peer Class
+##########################################################################################
 class Peer:
-    # constructor
     def __init__(self, id: int):
         self.id = id
 
@@ -154,7 +149,7 @@ class Peer:
         peer_info: Path = Path("PeerInfo.cfg")
 
         # create dict of other connections
-        self.connections = {}
+        self.connections: dict[int, socket.socket] = {}
 
         # populate common attributes
         with common.open() as f:
@@ -197,7 +192,7 @@ class Peer:
                             pass
 
         # populate peer info, dict to hold id/info pairs
-        self.peers = {}
+        self.peers: dict[int, tuple[str, int, int]] = {}
         with peer_info.open() as f:
             for line in f:
                 line = line.strip()
@@ -222,8 +217,7 @@ class Peer:
             print(f"[peer {self.id}] DEBUG: total_pieces = {total_pieces}")
 
         # dict to track states of peers
-        # initial state is choked and not interested
-        self.peer_states = {}
+        self.peer_states: dict[int, dict[str, bool]] = {}
         for pid in self.peers.keys():
             self.peer_states[pid] = {
                 "choked": True,
@@ -233,11 +227,11 @@ class Peer:
             }
 
         # Download tracking - bytes received from each peer in current interval
-        self.download_counts = {}
+        self.download_counts: dict[int, int] = {}
         self.download_lock = threading.Lock()
 
         # Optimistic unchoke tracking
-        self.optimistic_unchoked_peer = None
+        self.optimistic_unchoked_peer: int | None = None
 
         # Track last preferred neighbors to reduce log spam
         self.last_preferred_peers: set[int] = set()
@@ -252,7 +246,7 @@ class Peer:
             self.peers[self.id][2],
         )
 
-        # created dict to store bitfields of other peers
+        # dict to store bitfields of other peers
         self.peer_bitfields: dict[int, Bitfield] = {}
 
         # populate own bitfield based on has
@@ -260,14 +254,14 @@ class Peer:
         self.bitfield = Bitfield(self.total_pieces, has_file)
 
         # completion tracking
-        self.completed = {pid: False for pid in self.peers}
+        self.completed: dict[int, bool] = {pid: False for pid in self.peers}
         self.terminated = False
         if self._has_complete_file():
             self.completed[self.id] = True
 
         # global and per-peer request tracking
-        self.global_requests = set()
-        self.pending_requests = {}
+        self.global_requests: set[int] = set()
+        self.pending_requests: dict[int, int] = {}
 
         # log startup configuration for demo/video
         self._log_startup_config()
@@ -297,7 +291,7 @@ class Peer:
                 f"CONFIG: PeerInfo entry -> Peer [{pid}] at {host}:{port}, hasFile={has}."
             )
 
-        # Initial bitfield preview
+        # Initial bitfield preview (self)
         preview_len = min(32, self.total_pieces)
         bit_preview = "".join(str(b) for b in self.bitfield.bits[:preview_len])
         self._log(
@@ -331,7 +325,6 @@ class Peer:
         payload = body[1:]
         return msg_id, payload
 
-    # server-side functionality
     def begin_listening(self):
         # use self.id and PeerInfo.cfg
         if self.id not in self.peers:
@@ -361,7 +354,6 @@ class Peer:
                 self._log(f"ACCEPT ERROR: {e}")
                 break
 
-    # connect out to another peer using (host, port) from PeerInfo.cfg
     def dial_peer(self, host: str, port: int, remote_id: int):
         try:
             self.log_makes_connection(remote_id)
@@ -382,10 +374,12 @@ class Peer:
         try:
             my_handshake = build_handshake(self.id)
             connection.sendall(my_handshake)
+            self._log(f"HANDSHAKE OUT: Peer [{self.id}] → Peer [UNKNOWN UNTIL RECV].")
 
             try:
                 their_handshake = _recv_exact(connection, 32)
                 other_id = parse_handshake(their_handshake)
+                self._log(f"HANDSHAKE IN: Peer [{self.id}] ← Peer [{other_id}].")
                 if other_id is None:
                     if debug:
                         print(f"[peer {self.id}] invalid handshake received")
@@ -404,7 +398,7 @@ class Peer:
             # send BITFIELD only if we have at least one piece
             if any(self.bitfield.bits):
                 self.send_msg(connection, MSG_BITFIELD, self.bitfield.to_bytes())
-                self._log(f"Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
+                self._log(f"BITFIELD OUT: Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
 
             while True:
                 try:
@@ -431,7 +425,9 @@ class Peer:
             if debug:
                 print(f"[peer {self.id}] closed connection.")
 
-    # log helpers
+    # ---------------------------------------------------------------------
+    # Logging helpers
+    # ---------------------------------------------------------------------
     def _log_path(self) -> Path:
         return Path(f"log_peer_{self.id}.log")
 
@@ -440,13 +436,9 @@ class Peer:
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _log(self, line: str) -> None:
-        """
-        Write log line to file AND print it nicely to the terminal.
-        """
         ts = self._timestamp()
         formatted = f"[{ts}] {line}"
 
-        # write to log file
         with self.log_lock:
             try:
                 with self._log_path().open("a", encoding="utf-8") as f:
@@ -455,7 +447,6 @@ class Peer:
                 if debug:
                     print(f"[peer {self.id}] log error: {e}")
 
-        # mirror to console
         print(f"[peer {self.id}] {formatted}")
 
     def log_makes_connection(self, other_id: int) -> None:
@@ -470,9 +461,7 @@ class Peer:
     def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket, other_id: int):
         if msg_id == MSG_CHOKE:
             self.peer_states[other_id]["is_choked"] = True
-            self._log(f"Peer [{self.id}] is choked by [{other_id}].")
-            if debug:
-                print(f"[peer {self.id}] choked by peer {other_id}")
+            self._log(f"MSG CHOKE IN: Peer [{self.id}] is choked by Peer [{other_id}].")
 
             # cancel pending request, if any
             if other_id in self.pending_requests:
@@ -480,27 +469,22 @@ class Peer:
                 if piece_lost in self.global_requests:
                     self.global_requests.remove(piece_lost)
                 self._log(
-                    f"Peer [{self.id}] pending request {piece_lost} cancelled due to choke by [{other_id}]."
+                    f"REQUEST CANCELLED: Peer [{self.id}] pending request for piece {piece_lost} "
+                    f"cancelled due to choke by Peer [{other_id}]."
                 )
 
         elif msg_id == MSG_UNCHOKE:
             self.peer_states[other_id]["is_choked"] = False
-            self._log(f"Peer [{self.id}] is unchoked by [{other_id}].")
-            if debug:
-                print(f"[peer {self.id}] unchoked by peer {other_id}")
+            self._log(f"MSG UNCHOKE IN: Peer [{self.id}] is unchoked by Peer [{other_id}].")
             self.request_piece(conn, other_id)
 
         elif msg_id == MSG_INTERESTED:
             self.peer_states[other_id]["interested"] = True
-            self._log(f"Peer [{self.id}] received the 'interested' message from [{other_id}].")
-            if debug:
-                print(f"[peer {self.id}] received INTERESTED from peer {other_id}")
+            self._log(f"MSG INTERESTED IN: Peer [{self.id}] received 'interested' from Peer [{other_id}].")
 
         elif msg_id == MSG_NOT_INTERESTED:
             self.peer_states[other_id]["interested"] = False
-            self._log(f"Peer [{self.id}] received the 'not interested' message from [{other_id}].")
-            if debug:
-                print(f"[peer {self.id}] received NOT INTERESTED from peer {other_id}")
+            self._log(f"MSG NOT_INTERESTED IN: Peer [{self.id}] received 'not interested' from Peer [{other_id}].")
 
         elif msg_id == MSG_HAVE:
             piece_index = _from_u32(payload)
@@ -508,27 +492,45 @@ class Peer:
             if other_id not in self.peer_bitfields:
                 self.peer_bitfields[other_id] = Bitfield(self.total_pieces, False)
             self.peer_bitfields[other_id].set_piece(piece_index)
+
             self._log(
-                f"Peer [{self.id}] received the 'have' message from [{other_id}] for the piece {piece_index}."
+                f"MSG HAVE IN: Peer [{self.id}] received 'have' for piece {piece_index} "
+                f"from Peer [{other_id}]."
             )
-            if debug:
-                print(f"[peer {self.id}] received HAVE for piece {piece_index} from peer {other_id}")
+
+            # Show updated view of other peer's bitfield (first 32 bits)
+            preview_len = min(32, self.total_pieces)
+            bits = self.peer_bitfields[other_id].bits[:preview_len]
+            bit_str = "".join(str(b) for b in bits)
+            self._log(
+                f"BITFIELD UPDATE: Peer [{self.id}]'s view of Peer [{other_id}] now has piece {piece_index}. "
+                f"First {preview_len} pieces = {bit_str}"
+            )
 
             # Decide if we are (still) interested in this neighbor
             if self._has_interesting_pieces(other_id):
                 self.send_interested(conn, other_id)
             else:
                 self.send_not_interested(conn, other_id)
+                self._log(
+                    f"MSG NOT_INTERESTED OUT: Peer [{self.id}] sent 'not interested' to Peer [{other_id}] "
+                    f"(no needed pieces)."
+                )
 
         elif msg_id == MSG_BITFIELD:
             self.peer_bitfields[other_id] = Bitfield.from_bytes(payload, self.total_pieces)
-            if debug:
-                print(
-                    f"[peer {self.id}] DEBUG: received bitfield with "
-                    f"{sum(self.peer_bitfields[other_id].bits)} pieces set out of {self.total_pieces}"
-                )
-                print(f"[peer {self.id}] received bitfield {self.peer_bitfields[other_id].bits[:8]}...")
-            self._log(f"Peer [{self.id}] received BITFIELD from [{other_id}].")
+
+            self._log(
+                f"BITFIELD IN: Peer [{self.id}] received BITFIELD from Peer [{other_id}]."
+            )
+
+            # Preview other peer's bitfield (first 32 bits)
+            preview_len = min(32, self.total_pieces)
+            bits = self.peer_bitfields[other_id].bits[:preview_len]
+            bit_str = "".join(str(b) for b in bits)
+            self._log(
+                f"BITFIELD INIT: Peer [{self.id}]'s view of Peer [{other_id}] first {preview_len} pieces = {bit_str}"
+            )
 
             if self._has_interesting_pieces(other_id):
                 self.send_interested(conn, other_id)
@@ -537,18 +539,24 @@ class Peer:
 
         elif msg_id == MSG_REQUEST:
             piece_index = _from_u32(payload)
-            if debug:
-                print(f"[peer {self.id}] received REQUEST for piece {piece_index} from peer {other_id}")
+
+            self._log(
+                f"MSG REQUEST IN: Peer [{self.id}] received REQUEST for piece {piece_index} "
+                f"from Peer [{other_id}]."
+            )
 
             if not self.peer_states[other_id]["choked"] and self.bitfield.has_piece(piece_index):
                 piece_data = self.file_manager.get_piece(piece_index)
                 piece_payload = _u32(piece_index) + piece_data
                 self.send_msg(conn, MSG_PIECE, piece_payload)
-                if debug:
-                    print(f"[peer {self.id}] sent PIECE {piece_index} to peer {other_id}")
+                self._log(
+                    f"PIECE OUT: Peer [{self.id}] sent piece {piece_index} to Peer [{other_id}]."
+                )
             else:
-                if debug:
-                    print(f"[peer {self.id}] denied REQUEST for piece {piece_index} (choked or don't have)")
+                self._log(
+                    f"REQUEST DENIED: Peer [{self.id}] cannot serve piece {piece_index} to "
+                    f"Peer [{other_id}] (either choked or missing piece)."
+                )
 
         elif msg_id == MSG_PIECE:
             piece_index = _from_u32(payload[:4])
@@ -569,22 +577,25 @@ class Peer:
             num_pieces = sum(self.bitfield.bits)
 
             self._log(
-                f"Peer [{self.id}] has downloaded the piece {piece_index} from [{other_id}]. "
-                f"Now the number of pieces it has is {num_pieces}."
+                f"MSG PIECE IN: Peer [{self.id}] downloaded piece {piece_index} from Peer [{other_id}]. "
+                f"Now has {num_pieces}/{self.total_pieces} pieces."
             )
-            if debug:
-                print(
-                    f"[peer {self.id}] received PIECE {piece_index} from peer {other_id}. "
-                    f"Total pieces: {num_pieces}"
-                )
 
+            # Show our updated bitfield (self) after this piece
+            preview_len = min(32, self.total_pieces)
+            bits = self.bitfield.bits[:preview_len]
+            bit_str = "".join(str(b) for b in bits)
+            self._log(
+                f"BITFIELD UPDATE: Peer [{self.id}] now has piece {piece_index}. "
+                f"First {preview_len} pieces = {bit_str}"
+            )
+
+            # broadcast HAVE
             self.broadcast_have(piece_index)
 
             if num_pieces == self.total_pieces:
                 self.file_manager.assemble_file()
-                self._log(f"Peer [{self.id}] has downloaded the COMPLETE file.")
-                if debug:
-                    print(f"[peer {self.id}] COMPLETE FILE DOWNLOADED!")
+                self._log(f"COMPLETE FILE: Peer [{self.id}] has downloaded and assembled the full file.")
                 self.completed[self.id] = True
                 self.broadcast_complete()
                 self.check_for_shutdown()
@@ -594,9 +605,7 @@ class Peer:
 
         elif msg_id == MSG_COMPLETE:
             self.completed[other_id] = True
-            self._log(f"Peer [{self.id}] received COMPLETE from [{other_id}].")
-            if debug:
-                print(f"[peer {self.id}] peer {other_id} reported completion.")
+            self._log(f"MSG COMPLETE IN: Peer [{self.id}] received COMPLETE from Peer [{other_id}].")
             self.check_for_shutdown()
 
     def _has_interesting_pieces(self, other_id: int) -> bool:
@@ -617,7 +626,7 @@ class Peer:
         if other_id not in self.peer_bitfields:
             return
 
-        available_pieces = []
+        available_pieces: list[int] = []
         for i in range(self.total_pieces):
             if (
                 self.peer_bitfields[other_id].has_piece(i)
@@ -627,8 +636,9 @@ class Peer:
                 available_pieces.append(i)
 
         if not available_pieces:
-            if debug:
-                print(f"[peer {self.id}] no pieces to request from peer {other_id}")
+            self._log(
+                f"REQUEST: Peer [{self.id}] has no missing pieces to request from Peer [{other_id}]."
+            )
             return
 
         piece_index = random.choice(available_pieces)
@@ -638,28 +648,33 @@ class Peer:
         self.pending_requests[other_id] = piece_index
 
         self.send_msg(conn, MSG_REQUEST, _u32(piece_index))
-        self._log(f"Peer [{self.id}] requested piece {piece_index} from [{other_id}].")
-        if debug:
-            print(f"[peer {self.id}] sent REQUEST for piece {piece_index} to peer {other_id}")
+        self._log(f"REQUEST OUT: Peer [{self.id}] requested piece {piece_index} from Peer [{other_id}].")
 
     def broadcast_have(self, piece_index: int):
         for pid, conn in self.connections.items():
             try:
                 self.send_msg(conn, MSG_HAVE, _u32(piece_index))
-                if debug:
-                    print(f"[peer {self.id}] sent HAVE for piece {piece_index} to peer {pid}")
             except Exception as e:
                 if debug:
                     print(f"[peer {self.id}] failed to send HAVE to peer {pid}: {e}")
+
+        peers = ",".join(str(pid) for pid in self.connections.keys()) or "(none)"
+        self._log(
+            f"HAVE OUT: Peer [{self.id}] broadcasted 'have' for piece {piece_index} "
+            f"to peers {peers}."
+        )
 
     def broadcast_complete(self):
         for pid, conn in self.connections.items():
             try:
                 self.send_msg(conn, MSG_COMPLETE)
-                if debug:
-                    print(f"[peer {self.id}] sent COMPLETE to peer {pid}")
             except Exception:
                 pass
+
+        peers = ",".join(str(pid) for pid in self.connections.keys()) or "(none)"
+        self._log(
+            f"COMPLETE OUT: Peer [{self.id}] broadcasted COMPLETE to peers {peers}."
+        )
 
     def check_for_shutdown(self):
         if self.terminated:
@@ -667,9 +682,7 @@ class Peer:
 
         if all(self.completed.values()):
             self.terminated = True
-            self._log(f"Peer [{self.id}] terminating: All peers have completed the file.")
-            if debug:
-                print(f"[peer {self.id}] ALL PEERS COMPLETE — shutting down.")
+            self._log(f"TERMINATE: Peer [{self.id}] exiting because ALL peers have the complete file.")
 
             for conn in list(self.connections.values()):
                 try:
@@ -685,15 +698,15 @@ class Peer:
                 self.download_counts[from_peer] = 0
             self.download_counts[from_peer] += num_bytes
 
-    def choke_peer(self, conn: socket.socket, other_id):
+    def choke_peer(self, conn: socket.socket, other_id: int):
         self.send_msg(conn, MSG_CHOKE)
         self.peer_states[other_id]["choked"] = True
-        self._log(f"Peer [{self.id}] choked its connection.")
+        self._log(f"MSG CHOKE OUT: Peer [{self.id}] choked Peer [{other_id}].")
 
-    def unchoke_peer(self, conn: socket.socket, other_id):
+    def unchoke_peer(self, conn: socket.socket, other_id: int):
         self.send_msg(conn, MSG_UNCHOKE)
         self.peer_states[other_id]["choked"] = False
-        self._log(f"Peer [{self.id}] unchoked its connection.")
+        self._log(f"MSG UNCHOKE OUT: Peer [{self.id}] unchoked Peer [{other_id}].")
 
     def send_interested(self, conn: socket.socket, other_id: int):
         """
@@ -701,35 +714,25 @@ class Peer:
         not-interested -> interested for this peer.
         """
         if self.peer_states[other_id]["is_interested"]:
-            if debug:
-                print(f"[peer {self.id}] already INTERESTED in {other_id}, not resending")
             return
 
         self.send_msg(conn, MSG_INTERESTED)
         self.peer_states[other_id]["is_interested"] = True
-        self._log(f"Peer [{self.id}] sent 'interested' to [{other_id}].")
-        if debug:
-            print(f"[peer {self.id}] sent INTERESTED to peer {other_id}")
+        self._log(f"MSG INTERESTED OUT: Peer [{self.id}] sent 'interested' to Peer [{other_id}].")
 
     def send_not_interested(self, conn: socket.socket, other_id: int):
-        """
-        Send NOT_INTERESTED only if we are transitioning from
-        interested -> not-interested for this peer.
-        """
+        # Only send if transitioning to NOT interested
         if not self.peer_states[other_id]["is_interested"]:
-            if debug:
-                print(f"[peer {self.id}] already NOT INTERESTED in {other_id}, not resending")
             return
 
         self.send_msg(conn, MSG_NOT_INTERESTED)
         self.peer_states[other_id]["is_interested"] = False
-        self._log(f"Peer [{self.id}] sent 'not interested' to [{other_id}].")
-        if debug:
-            print(f"[peer {self.id}] sent NOT INTERESTED to peer {other_id}")
 
-    def send_request(self, conn: socket.socket, other_id):
-        self.send_msg(conn, MSG_REQUEST)
-        self._log(f"Peer [{self.id}] has downloaded the piece TBD from [{other_id}]")
+        self._log(
+            f"MSG NOT_INTERESTED OUT: Peer [{self.id}] sent 'not interested' to Peer [{other_id}] "
+            f"(no missing pieces from that peer)."
+        )
+
 
     def start_choke_unchoke_loop(self):
         """Periodically select preferred neighbors."""
@@ -748,8 +751,9 @@ class Peer:
         ]
 
         if not interested_peers:
-            if debug:
-                print(f"[peer {self.id}] no interested peers to unchoke")
+            self._log(
+                f"PREF NEIGHBORS: Peer [{self.id}] found no interested peers this interval."
+            )
             return
 
         # Determine preferred peers
@@ -760,37 +764,31 @@ class Peer:
         else:
             # Select by download rate
             with self.download_lock:
-                # Sort by download rate (descending)
                 rates = [(pid, self.download_counts.get(pid, 0)) for pid in interested_peers]
                 rates.sort(key=lambda x: x[1], reverse=True)
 
-                # Handle ties randomly - group by rate, shuffle within groups
-                grouped = {}
+                # group by rate, shuffle within groups
+                grouped: dict[int, list[int]] = {}
                 for pid, rate in rates:
-                    if rate not in grouped:
-                        grouped[rate] = []
-                    grouped[rate].append(pid)
+                    grouped.setdefault(rate, []).append(pid)
 
-                sorted_peers = []
+                sorted_peers: list[int] = []
                 for rate in sorted(grouped.keys(), reverse=True):
                     peers_at_rate = grouped[rate]
                     random.shuffle(peers_at_rate)
                     sorted_peers.extend(peers_at_rate)
 
                 preferred_peers = sorted_peers[: self.preferred_neighbors]
-
                 # Reset download counts for next interval
                 self.download_counts.clear()
 
-        # Log preferred neighbors only if the set changed
         new_set = set(preferred_peers)
         if new_set != self.last_preferred_peers:
             self.last_preferred_peers = new_set
             self._log(
-                f"Peer [{self.id}] has the preferred neighbors {','.join(map(str, preferred_peers))}."
+                f"PREF NEIGHBORS: Peer [{self.id}] selected preferred neighbors "
+                f"{','.join(map(str, preferred_peers))}."
             )
-        if debug:
-            print(f"[peer {self.id}] preferred neighbors: {preferred_peers}")
 
         # Unchoke preferred, choke others (but not optimistic unchoke)
         for pid in list(self.connections.keys()):
@@ -820,8 +818,9 @@ class Peer:
         ]
 
         if not candidates:
-            if debug:
-                print(f"[peer {self.id}] no candidates for optimistic unchoke")
+            self._log(
+                f"OPTIMISTIC UNCHOKE: Peer [{self.id}] found no choked-but-interested candidates."
+            )
             return
 
         # Randomly select one
@@ -831,13 +830,14 @@ class Peer:
         # Unchoke them
         self.unchoke_peer(self.connections[selected], selected)
 
-        self._log(f"Peer [{self.id}] has the optimistically unchoked neighbor {selected}.")
-        if debug:
-            print(f"[peer {self.id}] optimistically unchoked: {selected}")
+        self._log(
+            f"OPTIMISTIC UNCHOKE: Peer [{self.id}] chose Peer [{selected}] as optimistically unchoked."
+        )
 
 
 ##########################################################################################
 # Bitfield Class
+##########################################################################################
 class Bitfield:
     def __init__(self, total_pieces: int, has_all: bool):
         self.bits = [1 if has_all else 0] * total_pieces
@@ -873,6 +873,7 @@ class Bitfield:
 
 ##########################################################################################
 # Main Function
+##########################################################################################
 if __name__ == "__main__":
     id: int = int(sys.argv[1])
     peer = Peer(id)
@@ -887,12 +888,19 @@ if __name__ == "__main__":
     # periodic choke/unchoke
     unchoke_thread = Thread(target=peer.start_choke_unchoke_loop, daemon=True)
     unchoke_thread.start()
+    peer._log(
+        f"UNCHOKE LOOP STARTED: Every {peer.unchoking_interval} seconds with "
+        f"k={peer.preferred_neighbors} preferred neighbors."
+    )
 
     # optimistic unchoke loop
     optimistic_thread = Thread(target=peer.start_optimistic_unchoke_loop, daemon=True)
     optimistic_thread.start()
+    peer._log(
+        f"OPTIMISTIC UNCHOKE LOOP STARTED: Every {peer.optimistic_interval} seconds."
+    )
 
-    # autoconnector
+    # autoconnector (each peer connects to all peers with ID < its own)
     for pid, info in peer.peers.items():
         if pid < peer.id:
             host, port, has = info
