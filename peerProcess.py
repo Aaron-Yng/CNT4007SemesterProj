@@ -1,7 +1,6 @@
 import socket
 import threading
 from threading import Thread
-import pathlib
 from pathlib import Path
 import sys
 import struct
@@ -292,7 +291,7 @@ class Peer:
                 f"CONFIG: PeerInfo entry -> Peer [{pid}] at {host}:{port}, hasFile={has}."
             )
 
-        # Initial bitfield preview
+        # Initial bitfield preview (self)
         preview_len = min(32, self.total_pieces)
         bit_preview = "".join(str(b) for b in self.bitfield.bits[:preview_len])
         self._log(
@@ -329,8 +328,7 @@ class Peer:
     def begin_listening(self):
         # use self.id and PeerInfo.cfg
         if self.id not in self.peers:
-            if debug:
-                print(f"[peer {self.id}] not in PeerInfo.cfg; cannot listen.")
+            self._log(f"ERROR: Peer [{self.id}] not in PeerInfo.cfg; cannot listen.")
             return
         host, port, has = self.peers[self.id]
 
@@ -340,40 +338,44 @@ class Peer:
         sock.bind((host, int(port)))
         sock.listen(int(self.preferred_neighbors))
 
-        if debug:
-            print(f"[peer {self.id}] listening on {host}:{port} (backlog={self.preferred_neighbors})")
+        self._log(
+            f"LISTEN: Peer [{self.id}] listening on {host}:{port} "
+            f"(backlog={self.preferred_neighbors})."
+        )
 
         while True:
             try:
                 connection, addr = sock.accept()
-                if debug:
-                    print(f"[peer {self.id}] accepted from {addr}")
+                self._log(
+                    f"ACCEPT: Peer [{self.id}] accepted inbound TCP connection from {addr}."
+                )
                 Thread(target=self.connect_peer, args=(connection,), daemon=True).start()
             except Exception as e:
-                if debug:
-                    print(f"[peer {self.id}] accept error: {e}")
+                self._log(f"ACCEPT ERROR: {e}")
                 break
 
     def dial_peer(self, host: str, port: int, remote_id: int):
-        if remote_id in self.connections:
-            return
-
         try:
-            s = socket.create_connection((host, int(port)), timeout=3)
-            # log: we (self.id) make a connection to remote_id
             self.log_makes_connection(remote_id)
+            s = socket.create_connection((host, int(port)), timeout=3)
+            self._log(
+                f"TCP CONNECTION BUILT: Peer [{self.id}] connected to Peer [{remote_id}] "
+                f"at {host}:{port}."
+            )
             # reuse handler
             self.connect_peer(s)
         except Exception as e:
-            if debug:
-                print(f"[peer {self.id}] dial to {host}:{port} failed: {e}")
+            self._log(
+                f"DIAL ERROR: Peer [{self.id}] failed to connect to Peer [{remote_id}] "
+                f"at {host}:{port}. Error={e}"
+            )
 
     def connect_peer(self, connection: socket.socket):
         try:
             my_handshake = build_handshake(self.id)
             connection.sendall(my_handshake)
+            self._log(f"HANDSHAKE OUT: Peer [{self.id}] → Peer [UNKNOWN UNTIL RECV].")
 
-            #receive handshake
             try:
                 their_handshake = _recv_exact(connection, 32)
                 other_id = parse_handshake(their_handshake)
@@ -381,55 +383,47 @@ class Peer:
                 if other_id is None:
                     if debug:
                         print(f"[peer {self.id}] invalid handshake received")
-                    connection.close()
                     return
+                self.log_connected_from(other_id)
+                if debug:
+                    print(f"[peer {self.id}] handshake successful with peer {other_id}")
+                # add to connections
+                self.connections[other_id] = connection
+
             except Exception as e:
                 if debug:
                     print(f"[peer {self.id}] failed receiving handshake: {e}")
-                connection.close()
                 return
 
-            #check for duplicate
-            if other_id in self.connections:
-                #close new connection if already exists
-                try:
-                    connection.close()
-                except:
-                    pass
-                return
-
-            #log n store connection
-            self.log_connected_from(other_id)
-            self.connections[other_id] = connection
-
-            if debug:
-                print(f"[peer {self.id}] handshake successful with peer {other_id}")
-
-            #send bitfield if have pieces
+            # send BITFIELD only if we have at least one piece
             if any(self.bitfield.bits):
                 self.send_msg(connection, MSG_BITFIELD, self.bitfield.to_bytes())
                 self._log(f"BITFIELD OUT: Peer [{self.id}] sent BITFIELD to Peer [{other_id}].")
 
-            #enter loop
             while True:
                 try:
                     msg_id, payload = self.recv_msg(connection)
                     self.handle_message(msg_id, payload, connection, other_id)
                 except ConnectionError:
+                    if debug:
+                        print(f"[peer {self.id}] connection closed by peer {other_id}")
                     break
                 except Exception as e:
                     if debug:
                         print(f"[peer {self.id}] error in message loop: {e}")
                     break
 
+        except Exception as e:
+            if debug:
+                print(f"[peer {self.id}] handler error: {e}")
+
         finally:
             try:
                 connection.close()
             except:
                 pass
-            if other_id in self.connections and self.connections[other_id] is connection:
-                del self.connections[other_id]
-
+            if debug:
+                print(f"[peer {self.id}] closed connection.")
 
     # ---------------------------------------------------------------------
     # Logging helpers
@@ -456,11 +450,14 @@ class Peer:
         print(f"[peer {self.id}] {formatted}")
 
     def log_makes_connection(self, other_id: int) -> None:
-        self._log(f"Peer [{self.id}] makes a connection to Peer [{other_id}].")
+        self._log(f"PLAN: Peer [{self.id}] will make a connection to Peer [{other_id}].")
 
     def log_connected_from(self, other_id: int) -> None:
         self._log(f"Peer [{self.id}] is connected from Peer [{other_id}].")
 
+    # ---------------------------------------------------------------------
+    # Message handling
+    # ---------------------------------------------------------------------
     def handle_message(self, msg_id: int, payload: bytes, conn: socket.socket, other_id: int):
         if msg_id == MSG_CHOKE:
             self.peer_states[other_id]["is_choked"] = True
@@ -881,6 +878,9 @@ if __name__ == "__main__":
     id: int = int(sys.argv[1])
     peer = Peer(id)
 
+    # Nice extra log for the beginning of the demo
+    peer._log(f"PROCESS START: Peer [{id}] is up and running.")
+
     # listener
     t = Thread(target=peer.begin_listening, daemon=True)
     t.start()
@@ -908,7 +908,6 @@ if __name__ == "__main__":
 
     try:
         while True:
-            pass   # keep running; Ctrl+C to stop
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        if debug:
-            print(f"[peer {id}] exiting")
+        peer._log(f"MANUAL EXIT: Peer [{id}] received KeyboardInterrupt and is exiting.")
