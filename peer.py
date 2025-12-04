@@ -363,6 +363,9 @@ class Peer:
 
     # connect out to another peer using (host, port) from PeerInfo.cfg
     def dial_peer(self, host: str, port: int, remote_id: int):
+        if remote_id in self.connections:
+            return
+
         try:
             self.log_makes_connection(remote_id)
             s = socket.create_connection((host, int(port)), timeout=3)
@@ -379,6 +382,13 @@ class Peer:
             )
 
     def connect_peer(self, connection: socket.socket):
+        if other_id in self.connections:
+            try:
+                connection.close()
+            except:
+                pass
+            return
+
         try:
             my_handshake = build_handshake(self.id)
             connection.sendall(my_handshake)
